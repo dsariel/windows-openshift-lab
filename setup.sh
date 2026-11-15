@@ -236,20 +236,48 @@ check_hybrid_overlay() {
 # ----------------------------------------------------------------------------
 # Phase 2: Windows ISO
 # ----------------------------------------------------------------------------
+# Ask for the sudo password once, then keep the credential fresh in the background
+# so steps after long waits (ISO download, Windows install) never block on a prompt.
+sudo_keepalive() {
+  [[ $EUID -eq 0 ]] && return
+  info "Some steps need sudo (ISO/disk files in $IMG_DIR, packages)"
+  sudo -v || die "sudo is required."
+  local parent=$$
+  ( while kill -0 "$parent" 2>/dev/null; do sudo -n -v 2>/dev/null || exit; sleep 50; done ) &
+  disown
+}
+
+is_iso() {  # ISO9660 signature "CD001" at byte 32769
+  [[ -f "$1" ]] && (( $(stat -c %s "$1") > 4000000000 )) \
+    && [[ "$(dd if="$1" bs=1 skip=32769 count=5 2>/dev/null | tr -d '\0')" == "CD001" ]]
+}
+
+remote_size() {
+  curl -sIL -m 30 "$1" | awk 'tolower($1)=="content-length:" {n=$2} END {gsub(/\r/, "", n); print n+0}'
+}
+
 ensure_iso() {
   phase 2 "Windows Server 2025 ISO" "one-time ~6GB download"
-  if [[ -f "$WIN_ISO" ]] && (( $(stat -c %s "$WIN_ISO") > 4000000000 )); then
+  if is_iso "$WIN_ISO"; then
     ok "ISO present: $WIN_ISO"
     return
   fi
-  info "Downloading Windows Server 2025 Evaluation ISO to $WIN_ISO"
-  info "Source: $WIN_ISO_URL"
   sudo mkdir -p "$IMG_DIR"
-  sudo curl -fL --retry 5 --retry-delay 5 -C - --progress-bar -o "$WIN_ISO.part" "$WIN_ISO_URL" \
-    || die "ISO download failed. Download it manually and set WIN_ISO=/path/to.iso"
-  (( $(stat -c %s "$WIN_ISO.part") > 4000000000 )) || die "Downloaded file is too small - not a valid ISO."
-  sudo mv "$WIN_ISO.part" "$WIN_ISO"
-  ok "ISO downloaded ($(du -h "$WIN_ISO" | cut -f1))"
+  local part="$WIN_ISO.part" want have
+  want=$(remote_size "$WIN_ISO_URL")
+  have=$( [[ -f "$part" ]] && stat -c %s "$part" || echo 0 )
+  if (( have > 0 && have == want )) || { (( want == 0 )) && is_iso "$part"; }; then
+    info "Found a completed download from a previous run"
+  else
+    (( have > 0 )) && info "Resuming download ($((have/1024/1024))MB of $((want/1024/1024))MB already present)" \
+                   || info "Downloading Windows Server 2025 Evaluation ISO to $WIN_ISO"
+    info "Source: $WIN_ISO_URL"
+    sudo curl -fL --retry 5 --retry-delay 5 -C - --progress-bar -o "$part" "$WIN_ISO_URL" \
+      || die "ISO download failed. Download it manually and set WIN_ISO=/path/to.iso"
+  fi
+  is_iso "$part" || die "$part is not a valid ISO image. Delete it and re-run."
+  sudo mv "$part" "$WIN_ISO"
+  ok "ISO ready: $WIN_ISO ($(du -h "$WIN_ISO" | cut -f1))"
 }
 
 # ----------------------------------------------------------------------------
@@ -939,6 +967,7 @@ main() {
       ensure_libvirt_group "$@"
       echo "${C_B}Windows Server 2025 + OpenShift WMCO (BYOH) automated setup${C_0}"
       echo "Estimated total time: 25-40 minutes"
+      sudo_keepalive
       check_prereqs
       ensure_iso
       create_vm
@@ -950,6 +979,7 @@ main() {
       ;;
     cleanup)
       ensure_libvirt_group "$@"
+      sudo_keepalive
       cleanup
       ;;
     status)
