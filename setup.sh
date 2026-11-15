@@ -71,6 +71,7 @@ INSTALL_TIMEOUT_MIN="${INSTALL_TIMEOUT_MIN:-75}"
 NODE_TIMEOUT_MIN="${NODE_TIMEOUT_MIN:-40}"
 CRC_API_WAIT_MIN="${CRC_API_WAIT_MIN:-10}"
 WORKLOAD_TIMEOUT_MIN="${WORKLOAD_TIMEOUT_MIN:-40}"
+IIS_HTTP_TIMEOUT_MIN="${IIS_HTTP_TIMEOUT_MIN:-3}"
 
 TOTAL_PHASES=8
 START_TS=$(date +%s)
@@ -884,6 +885,7 @@ stop_updates() {
 update_windows() {
   phase 6 "Windows updates" "20-60 min, one-time"
   if [[ "$WIN_UPDATE" != "1" ]]; then warn "WIN_UPDATE=$WIN_UPDATE - skipping (containers may fail to start on an outdated host)"; return; fi
+  local build_at_start; build_at_start=$(host_build)
   wu_handle_leftover
 
   local want have
@@ -990,6 +992,13 @@ PSEOF
     hint "Use an image matching the host, e.g. IIS_IMAGE=... or check C:\\wmco-wu.log"
   else
     ok "Host build now $have"
+  fi
+
+  # Layers unpacked on the old build fail on the new one
+  # ("hcsshim::PrepareLayer ... unrecognized format (0xc0370112)"): start clean.
+  if [[ -n "$build_at_start" && "$have" != "$build_at_start" ]] && containerd_has_layers; then
+    info "Windows build changed ($build_at_start -> $have) on a node that already has container images"
+    reset_containerd auto
   fi
 }
 
@@ -1143,6 +1152,17 @@ pod_progress() {
   return 0
 }
 
+# True if an IIS pod got the stale-layer sandbox error after epoch $1
+stale_layer_errors_since() {
+  local since=$1 ts msg
+  while IFS='|' read -r ts msg; do
+    [[ -n "$ts" && "$msg" == *0xc0370112* ]] || continue
+    (( $(date -u -d "$ts" +%s 2>/dev/null || echo 0) >= since )) && return 0
+  done < <(oc get events -n "$TEST_NS" --field-selector reason=FailedCreatePodSandBox \
+             -o jsonpath='{range .items[*]}{.lastTimestamp}{"|"}{.message}{"\n"}{end}' 2>/dev/null || true)
+  return 1
+}
+
 iis_ready() {
   local ready
   ready=$(oc get deploy iis -n "$TEST_NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
@@ -1272,6 +1292,12 @@ EOF
     local m=$(( ($(date +%s) - t0) / 60 ))
     if (( m != last_min )); then
       pod_progress "${m} min elapsed"
+      # Image layers unpacked before a Windows update: reset containerd once, then keep waiting
+      if (( ! CONTAINERD_RESET_DONE )) && stale_layer_errors_since "$t0"; then
+        warn "Pod sandbox fails with 'PrepareLayer ... unrecognized format (0xc0370112)' - stale image layers"
+        reset_containerd auto
+        deadline=$(( $(date +%s) + WORKLOAD_TIMEOUT_MIN * 60 ))
+      fi
       last_min=$m
     fi
     sleep 15
@@ -1283,11 +1309,40 @@ EOF
     || warn "IIS pod is on $pod_node, expected $WIN_NODE"
 
   NODE_PORT=$(oc get svc iis -n "$TEST_NS" -o jsonpath='{.spec.ports[0].nodePort}')
-  if curl -fs -m 10 -o /dev/null "http://$WIN_IP:$NODE_PORT/"; then
-    ok "IIS responds at http://$WIN_IP:$NODE_PORT/"
-  else
-    warn "Could not reach http://$WIN_IP:$NODE_PORT/ from this host (may be a routing/firewall matter)"
+  check_iis_http
+}
+
+# Phase 8 is only successful when IIS really answers over the NodePort.
+# Retries for IIS_HTTP_TIMEOUT_MIN: the Windows NodePort rules (kube-proxy/HNS) can
+# lag a little behind pod readiness.
+check_iis_http() {
+  local url="http://$WIN_IP:$NODE_PORT/" t0 code="" server="" err=""
+  t0=$(date +%s)
+  info "Checking that IIS answers at $url"
+  while :; do
+    local hdr
+    hdr=$(curl -s -m 10 -D - -o /dev/null "$url" 2>&1) && {
+      code=$(awk 'toupper($1) ~ /^HTTP/ {c=$2} END {print c}' <<<"$hdr")
+      server=$(awk -F': ' 'tolower($1)=="server" {gsub(/\r/, "", $2); print $2}' <<<"$hdr")
+    } || err=$hdr
+    if [[ "$code" == 200 ]]; then
+      ok "IIS answers at $url (HTTP $code${server:+, Server: $server})"
+      return 0
+    fi
+    (( $(date +%s) - t0 > IIS_HTTP_TIMEOUT_MIN * 60 )) && break
+    sleep 10
+  done
+
+  # Narrow it down: is IIS itself up (pod IP from inside Windows) or only the NodePort path broken?
+  local pod_ip inside=""
+  pod_ip=$(oc get pod -n "$TEST_NS" -l app=iis -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)
+  if [[ -n "$pod_ip" ]]; then
+    inside=$(win_ps "try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 http://$pod_ip/).StatusCode } catch { 'error: ' + \$_.Exception.Message }" 2>/dev/null | tr -d '\r')
+    info "From Windows to the pod directly (http://$pod_ip/): ${inside:-no answer}"
   fi
+  hint "curl -v $url"
+  [[ "$inside" == 200 ]] && hint "IIS works inside the node - check kube-proxy / NodePort (Get-Service kube-proxy; hnsdiag list loadbalancers)"
+  die "IIS did not answer at $url within ${IIS_HTTP_TIMEOUT_MIN} min (last: ${code:+HTTP $code}${err:+${err:0:120}})."
 }
 
 # ----------------------------------------------------------------------------
@@ -1375,12 +1430,20 @@ PSEOF
 }
 
 # ----------------------------------------------------------------------------
+CONTAINERD_RESET_DONE=0
+containerd_has_layers() {
+  local n
+  n=$(win_ps "if (Get-Service containerd -ErrorAction SilentlyContinue) { (Get-ChildItem 'C:\ProgramData\containerd\root\io.containerd.snapshotter.v1.windows\snapshots' -Directory -ErrorAction SilentlyContinue | Measure-Object).Count } else { 0 }" 2>/dev/null | tr -d '\r')
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 ))
+}
+
 # Reset containerd storage on the Windows node (./setup.sh reset-containerd)
 # Moves the storage folder aside (not deleted, so it can be restored) so every image
 # is downloaded and unpacked fresh - e.g. after layers unpacked on an older Windows
 # build fail with "hcsshim::PrepareLayer ... unrecognized format (0xc0370112)".
 # ----------------------------------------------------------------------------
-reset_containerd() {
+reset_containerd() {  # [auto] = called from setup phases: no prompt, no follow-up hints
+  local mode=${1:-}
   mkdir -p "$WORK_DIR"
   vm_exists || die "VM '$VM_NAME' does not exist."
   WIN_IP="${WIN_IP:-$(discover_ip || true)}"
@@ -1391,7 +1454,7 @@ reset_containerd() {
   echo "${C_B}Reset containerd storage on $VM_NAME ($WIN_IP)${C_0}"
   info "Moves C:\\ProgramData\\containerd\\root aside (kept as root.bad-<time>) and restarts containerd + kubelet."
   info "All images on the node are downloaded again (IIS is ~2.4GB, ~15 min)."
-  if [[ "$FORCE" != "1" ]]; then
+  if [[ "$FORCE" != "1" && "$mode" != auto ]]; then
     [[ -t 0 ]] || die "Not interactive - run with FORCE=1 to confirm."
     local answer; read -r -p "    Continue? [y/N] " answer
     [[ "$answer" =~ ^[Yy]$ ]] || { info "Aborted"; return 0; }
@@ -1461,9 +1524,10 @@ PSEOF
   if [[ -n "$replicas" ]]; then
     oc scale deploy iis -n "$TEST_NS" --replicas="$replicas" >/dev/null
     ok "Scaled IIS back to $replicas"
-    info "Watch it come up: ./setup.sh observe-pod"
+    [[ "$mode" == auto ]] || info "Watch it come up: ./setup.sh observe-pod"
   fi
   info "The old storage folder can be deleted once IIS works (shown by ./setup.sh diagnose-windows)."
+  CONTAINERD_RESET_DONE=1
 }
 
 # ----------------------------------------------------------------------------
