@@ -57,6 +57,7 @@ HYBRID_HOST_PREFIX="${HYBRID_HOST_PREFIX:-23}"
 # Test workload
 TEST_NS="${TEST_NS:-wmco-test}"
 IIS_IMAGE="${IIS_IMAGE:-mcr.microsoft.com/windows/servercore/iis:windowsservercore-ltsc2025}"
+WIN_UPDATE="${WIN_UPDATE:-1}"                          # 1 = install Windows updates so the host matches the image build
 
 # Timeouts (minutes)
 INSTALL_TIMEOUT_MIN="${INSTALL_TIMEOUT_MIN:-75}"
@@ -64,7 +65,7 @@ NODE_TIMEOUT_MIN="${NODE_TIMEOUT_MIN:-40}"
 CRC_API_WAIT_MIN="${CRC_API_WAIT_MIN:-10}"
 WORKLOAD_TIMEOUT_MIN="${WORKLOAD_TIMEOUT_MIN:-40}"
 
-TOTAL_PHASES=7
+TOTAL_PHASES=8
 START_TS=$(date +%s)
 
 # ----------------------------------------------------------------------------
@@ -512,7 +513,7 @@ New-NetFirewallRule -Name 'WMCO-ICMP' -DisplayName 'WMCO-ICMP' -Direction Inboun
 Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
 Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name fDenyTSConnections -Value 0
 
-Write-Host '==> Avoid surprise reboots from Windows Update during setup'
+Write-Host '==> No automatic update reboots (setup.sh installs updates itself in a controlled phase)'
 New-Item -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -Force | Out-Null
 Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU' -Name NoAutoUpdate -Value 1
 
@@ -729,7 +730,135 @@ wait_for_access() {
 }
 
 # ----------------------------------------------------------------------------
-# Phase 6: WMCO + BYOH registration
+# Phase 6: Windows updates
+# ----------------------------------------------------------------------------
+# Process-isolated containers share the host kernel: the ltsc2025 images track the
+# latest cumulative update, and a host left at the ISO's build (e.g. 26100.1742 vs
+# image 26100.33822) fails with "hcs::System::Start ... exited unexpectedly".
+
+# Build revision (UBR) the test image was built for, from the MCR registry API
+image_ubr() {
+  local ref=${IIS_IMAGE#mcr.microsoft.com/} repo tag
+  repo=${ref%%:*}; tag=${ref##*:}
+  python3 - "$repo" "$tag" <<'PYEOF' 2>/dev/null || true
+import json, sys, urllib.request
+repo, tag = sys.argv[1:3]
+base = "https://mcr.microsoft.com/v2/" + repo
+acc = ", ".join(["application/vnd.docker.distribution.manifest.list.v2+json",
+                 "application/vnd.oci.image.index.v1+json",
+                 "application/vnd.docker.distribution.manifest.v2+json",
+                 "application/vnd.oci.image.manifest.v1+json"])
+get = lambda u: json.load(urllib.request.urlopen(urllib.request.Request(u, headers={"Accept": acc}), timeout=30))
+m = get(base + "/manifests/" + tag)
+if "manifests" in m:
+    v = next(x["platform"].get("os.version", "") for x in m["manifests"] if x["platform"].get("os") == "windows")
+else:
+    v = get(base + "/blobs/" + m["config"]["digest"]).get("os.version", "")
+print(v.split(".")[-1])
+PYEOF
+}
+
+host_build() {
+  win_ps "\$v=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'; \$v.CurrentBuild + '.' + \$v.UBR" 2>/dev/null | tr -d '\r'
+}
+
+wait_for_reboot() {
+  local t0; t0=$(date +%s)
+  # down...
+  while win_ssh "echo up" >/dev/null 2>&1; do
+    (( $(date +%s) - t0 > 300 )) && break
+    sleep 10
+  done
+  # ...and up again (installing updates during boot can take a while)
+  local last_min=-1
+  until win_ssh "echo up" >/dev/null 2>&1; do
+    (( $(date +%s) - t0 > 45 * 60 )) && die "Windows did not come back after the update reboot (45 min)."
+    local m=$(( ($(date +%s) - t0) / 60 ))
+    if (( m != last_min )); then info "  rebooting / applying updates... ${m} min"; last_min=$m; fi
+    sleep 15
+  done
+  ok "Windows is back after reboot ($(elapsed "$t0"))"
+}
+
+update_windows() {
+  phase 6 "Windows updates" "20-60 min, one-time"
+  if [[ "$WIN_UPDATE" != "1" ]]; then warn "WIN_UPDATE=$WIN_UPDATE - skipping (containers may fail to start on an outdated host)"; return; fi
+
+  local want have
+  want=$(image_ubr)
+  have=$(host_build)
+  info "Host build: ${have:-unknown}   container image ($IIS_IMAGE) build revision: ${want:-unknown}"
+  if [[ -n "$want" && "${have##*.}" =~ ^[0-9]+$ ]] && (( ${have##*.} >= want )); then
+    ok "Host is at least as new as the container image - no update needed"
+    return
+  fi
+
+  # The Windows Update API refuses remote (SSH) logons, so run it as SYSTEM in a scheduled task
+  cat > "$WORK_DIR/wmco-wu.ps1" <<'PSEOF'
+$log = 'C:\wmco-wu.log'
+function L($m) { Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date -Format s), $m) }
+try {
+  $session  = New-Object -ComObject Microsoft.Update.Session
+  $searcher = $session.CreateUpdateSearcher()
+  L 'Searching for updates'
+  $found = $searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0").Updates
+  L ("Found {0} update(s)" -f $found.Count)
+  if ($found.Count -eq 0) { Set-Content C:\wmco-wu.status 'NONE'; exit 0 }
+  $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+  foreach ($u in $found) { if (-not $u.EulaAccepted) { $u.AcceptEula() }; L ("  " + $u.Title); [void]$coll.Add($u) }
+  L 'Downloading'
+  $dl = $session.CreateUpdateDownloader(); $dl.Updates = $coll; [void]$dl.Download()
+  L 'Installing'
+  $in = $session.CreateUpdateInstaller(); $in.Updates = $coll; $res = $in.Install()
+  L ("Result {0}, reboot required: {1}" -f $res.ResultCode, $res.RebootRequired)
+  if ($res.RebootRequired) { Set-Content C:\wmco-wu.status 'REBOOT' } else { Set-Content C:\wmco-wu.status 'DONE' }
+} catch {
+  L ("ERROR " + $_)
+  Set-Content C:\wmco-wu.status ("ERROR " + $_)
+}
+PSEOF
+  scp "${SSH_OPTS[@]}" -q "$WORK_DIR/wmco-wu.ps1" "Administrator@$WIN_IP:C:/wmco-wu.ps1"
+
+  local round status t0 last_min
+  for round in 1 2 3 4; do
+    info "Update round $round: searching, downloading and installing (progress in C:\\wmco-wu.log)"
+    win_ssh "del /q C:\\wmco-wu.status 2>nul & schtasks /Create /F /TN wmco-wu /RU SYSTEM /RL HIGHEST /SC ONCE /ST 00:00 /TR \"powershell -NoProfile -ExecutionPolicy Bypass -File C:\\wmco-wu.ps1\" >nul & schtasks /Run /TN wmco-wu >nul" \
+      || die "Could not start the Windows Update task."
+    t0=$(date +%s); last_min=-1; status=""
+    while :; do
+      status=$(win_ssh "type C:\\wmco-wu.status 2>nul" 2>/dev/null | tr -d '\r' || true)
+      [[ -n "$status" ]] && break
+      (( $(date +%s) - t0 > 90 * 60 )) && die "Windows Update round $round did not finish within 90 min."
+      local m=$(( ($(date +%s) - t0) / 60 ))
+      if (( m != last_min )); then
+        info "  ${m} min - $(win_ssh "powershell -NoProfile -Command \"Get-Content C:\\wmco-wu.log -Tail 1\"" 2>/dev/null | tr -d '\r' | cut -c21- || true)"
+        last_min=$m
+      fi
+      sleep 30
+    done
+    case "$status" in
+      NONE)   ok "No more updates available"; break ;;
+      DONE)   ok "Updates installed (no reboot needed)" ;;
+      REBOOT) ok "Updates installed - rebooting ($(elapsed "$t0"))"
+              win_ssh "shutdown /r /t 5 /c \"WMCO setup: Windows updates\"" >/dev/null 2>&1 || true
+              wait_for_reboot ;;
+      *)      hint "ssh -i $SSH_KEY Administrator@$WIN_IP type C:\\wmco-wu.log"
+              die "Windows Update failed: $status" ;;
+    esac
+  done
+  win_ssh "schtasks /Delete /F /TN wmco-wu" >/dev/null 2>&1 || true
+
+  have=$(host_build)
+  if [[ -n "$want" && "${have##*.}" =~ ^[0-9]+$ ]] && (( ${have##*.} < want )); then
+    warn "Host build $have is still older than the image revision $want; containers may fail to start."
+    hint "Use an image matching the host, e.g. IIS_IMAGE=... or check C:\\wmco-wu.log"
+  else
+    ok "Host build now $have"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Phase 7: WMCO + BYOH registration
 # ----------------------------------------------------------------------------
 detect_wmco_package() {
   if [[ -n "$WMCO_PACKAGE" && -n "$WMCO_CATALOG" ]]; then return; fi
@@ -761,7 +890,7 @@ wait_for_csv() {
 }
 
 deploy_wmco() {
-  phase 6 "OpenShift integration (WMCO BYOH)" "5-15 min"
+  phase 7 "OpenShift integration (WMCO BYOH)" "5-15 min"
   detect_wmco_package
   info "Operator: $WMCO_PACKAGE (catalog $WMCO_CATALOG, channel $WMCO_CHANNEL)"
 
@@ -839,10 +968,10 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
-# Phase 7: Test workload
+# Phase 8: Test workload
 # ----------------------------------------------------------------------------
 deploy_workload() {
-  phase 7 "Test IIS workload" "1-2 min + image pull (servercore is ~2GB+)"
+  phase 8 "Test IIS workload" "1-2 min + image pull (servercore is ~2GB+)"
   oc apply -f - >/dev/null <<EOF
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -1072,6 +1201,7 @@ main() {
       create_vm
       wait_for_ip
       wait_for_access
+      update_windows
       deploy_wmco
       deploy_workload
       summary
