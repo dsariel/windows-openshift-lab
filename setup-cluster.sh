@@ -66,6 +66,26 @@ on_exit() {
 
 export PATH="$BIN_DIR:$HOME/.crc/bin/oc:$PATH"
 
+# Block suspend while the cluster is being created (see setup.sh: a suspend/resume
+# leaves the crc cluster "Unreachable" until 'crc stop && crc start').
+inhibit_sleep() {
+  [[ -n "${WMCO_INHIBITED:-}" ]] && return
+  command -v systemd-inhibit >/dev/null || return
+  export WMCO_INHIBITED=1
+  local what
+  for what in sleep:idle:handle-lid-switch sleep; do
+    systemd-inhibit --what="$what" --mode=block true >/dev/null 2>&1 && break
+    what=""
+  done
+  if [[ -z "$what" ]]; then
+    echo "  ⚠ Could not block system suspend (no permission). Keep the machine awake while this runs;" >&2
+    echo "    after a suspend/resume the crc cluster needs: crc stop && crc start" >&2
+    return
+  fi
+  exec systemd-inhibit --what="$what" --mode=block \
+    --who="WMCO cluster setup" --why="Creating the crc cluster" "$0" "$@"
+}
+
 # ----------------------------------------------------------------------------
 # Phase 1: Host checks
 # ----------------------------------------------------------------------------
@@ -176,6 +196,10 @@ crc_running() { crc status -o json 2>/dev/null | python3 -c 'import json,sys; sy
 
 start_cluster() {
   phase 3 "Start OpenShift cluster" "10-20 min on first start"
+  if [[ "$(crc status -o json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("crcStatus",""), d.get("openshiftStatus",""))' 2>/dev/null)" == "Running Unreachable" ]]; then
+    warn "crc VM is running but OpenShift is unreachable (e.g. after suspend/resume) - restarting it"
+    crc stop
+  fi
   if crc_running; then
     ok "Cluster already running"
   else
@@ -283,6 +307,7 @@ cleanup() {
 main() {
   case "${1:-setup}" in
     setup|"")
+      inhibit_sleep "$@"
       trap on_exit EXIT
       echo "${C_B}OpenShift Local cluster setup for WMCO${C_0}"
       echo "Estimated total time: 15-30 minutes (first run downloads ~4GB)"

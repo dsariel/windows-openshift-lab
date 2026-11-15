@@ -61,6 +61,7 @@ IIS_IMAGE="${IIS_IMAGE:-mcr.microsoft.com/windows/servercore/iis:windowsserverco
 # Timeouts (minutes)
 INSTALL_TIMEOUT_MIN="${INSTALL_TIMEOUT_MIN:-75}"
 NODE_TIMEOUT_MIN="${NODE_TIMEOUT_MIN:-40}"
+CRC_API_WAIT_MIN="${CRC_API_WAIT_MIN:-10}"
 WORKLOAD_TIMEOUT_MIN="${WORKLOAD_TIMEOUT_MIN:-40}"
 
 TOTAL_PHASES=7
@@ -158,16 +159,67 @@ install_packages() {
 
 # Log in automatically when the cluster is OpenShift Local (crc); tokens from
 # 'oc login' expire after ~24h, so a re-run the next day would otherwise fail.
+crc_field() {  # value of one field of 'crc status -o json' (empty if unavailable)
+  crc status -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1" 2>/dev/null || true
+}
+crc_status() { crc_field openshiftStatus; }
+
+# Keep the laptop from suspending while we run: a host suspend/resume jumps the
+# crc VM's clock, which leaves OpenShift "Unreachable" until 'crc stop && crc start',
+# and would also break the Windows install and our timeouts.
+inhibit_sleep() {
+  [[ -n "${WMCO_INHIBITED:-}" ]] && return
+  command -v systemd-inhibit >/dev/null || return
+  export WMCO_INHIBITED=1
+  local what
+  for what in sleep:idle:handle-lid-switch sleep; do
+    systemd-inhibit --what="$what" --mode=block true >/dev/null 2>&1 && break
+    what=""
+  done
+  if [[ -z "$what" ]]; then
+    echo "  ⚠ Could not block system suspend (no permission). Keep the machine awake while this runs;" >&2
+    echo "    after a suspend/resume the crc cluster needs: crc stop && crc start" >&2
+    return
+  fi
+  exec systemd-inhibit --what="$what" --mode=block \
+    --who="WMCO setup" --why="Installing Windows node; suspend would break the crc cluster" \
+    "$0" "$@"
+}
+
 ensure_oc_login() {
   local err
   if err=$(oc whoami 2>&1); then return; fi
   if command -v crc >/dev/null && [[ -d "$HOME/.crc/machines/crc" ]]; then
-    local st
-    st=$(crc status -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("openshiftStatus",""))' 2>/dev/null || true)
-    if [[ "$st" != "Running" ]]; then
-      hint "Start it with: crc start   (or ./setup-cluster.sh)"
-      die "The crc cluster is not running (status: ${st:-unknown})."
-    fi
+    local st t0 last_min=-1
+    t0=$(date +%s)
+    while :; do
+      st=$(crc_status)
+      [[ "$st" == "Running" ]] && break
+      # Stopped / no VM: waiting will not help
+      if [[ "$st" == "Stopped" || "$st" == "" ]] && [[ "$(crc_field crcStatus)" != "Running" ]]; then
+        hint "Start it with: crc start   (or ./setup-cluster.sh)"
+        die "The crc cluster is not running (status: ${st:-unknown})."
+      fi
+      # VM up but almost no RAM in use: OpenShift is not running inside it (typical
+      # after a host suspend/resume). It will not recover by itself.
+      local ram; ram=$(crc_field ramUsage)
+      if [[ "$ram" =~ ^[0-9]+$ ]] && (( ram > 0 && ram < 2 * 1024 * 1024 * 1024 )); then
+        hint "This usually follows a laptop suspend/resume. Restart the cluster:"
+        hint "crc stop && crc start     # then re-run ./setup.sh"
+        die "crc VM is running but OpenShift is not ($(( ram / 1024 / 1024 ))MB RAM in use, API '$st')."
+      fi
+      # VM is up but the API is not answering yet (e.g. after suspend/reboot): wait
+      if (( $(date +%s) - t0 > CRC_API_WAIT_MIN * 60 )); then
+        hint "getent hosts api.crc.testing        # must resolve to $(crc ip 2>/dev/null || echo 'the crc IP')"
+        hint "curl -k https://api.crc.testing:6443/readyz"
+        hint "oc --kubeconfig ~/.crc/machines/crc/kubeconfig get co"
+        hint "If the laptop was suspended: crc stop && crc start"
+        die "crc VM is running but the OpenShift API stayed '$st' for ${CRC_API_WAIT_MIN} min."
+      fi
+      local m=$(( ($(date +%s) - t0) / 60 ))
+      if (( m != last_min )); then info "crc API status '$st' - waiting for it to recover (${m} min)"; last_min=$m; fi
+      sleep 15
+    done
     info "oc session expired or missing - logging in to crc as kubeadmin"
     local creds user pass api
     creds=$(crc console --credentials -o json)
@@ -998,6 +1050,7 @@ cleanup() {
 main() {
   case "${1:-setup}" in
     setup|"")
+      inhibit_sleep "$@"
       trap 'FAIL_LINE=$LINENO' ERR
       trap on_exit EXIT
       ensure_libvirt_group "$@"
