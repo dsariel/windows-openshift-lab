@@ -5,6 +5,7 @@
 #   ./setup.sh           Run the full automated setup
 #   ./setup.sh cleanup   Remove the VM and all OpenShift resources (keeps the ISO)
 #   ./setup.sh status    Show VM / node / workload status
+#   ./setup.sh observe-pod   Print the IIS pod table + new pod events every minute until ready
 #   ./setup.sh stop-windows-updates  Stop the Windows Update task on the VM if it is only searching
 #
 # Every setting below can be overridden from the environment, e.g.:
@@ -1101,6 +1102,53 @@ EOF
 # ----------------------------------------------------------------------------
 # Phase 8: Test workload
 # ----------------------------------------------------------------------------
+declare -A SEEN_EVENTS=()
+
+# One progress report: the pod table plus every pod event not printed before
+# (the useful part of 'oc describe pod'). Used by phase 8 and './setup.sh observe-pod'.
+pod_progress() {
+  info "$1 - pods (oc get pods -n $TEST_NS -o wide):"
+  oc get pods -n "$TEST_NS" -l app=iis -o wide 2>/dev/null | cut -c1-150 | sed 's/^/      /' || true
+  local ev uid rest ev_type ev_reason ev_obj ev_msg
+  while IFS= read -r ev; do
+    [[ -n "$ev" ]] || continue
+    uid=${ev%%|*}; rest=${ev#*|}
+    [[ -n "${SEEN_EVENTS[$uid]:-}" ]] && continue
+    SEEN_EVENTS[$uid]=1
+    IFS='|' read -r ev_type ev_reason ev_obj ev_msg <<<"$rest"
+    printf '      event: %-7s %-10s %s: %s\n' "$ev_type" "$ev_reason" "$ev_obj" "$ev_msg"
+  done < <(oc get events -n "$TEST_NS" --field-selector involvedObject.kind=Pod \
+             --sort-by=.metadata.creationTimestamp \
+             -o jsonpath='{range .items[*]}{.metadata.uid}{"|"}{.type}{"|"}{.reason}{"|"}{.involvedObject.name}{"|"}{.message}{"\n"}{end}' 2>/dev/null \
+           | awk -F'|' '$4 ~ /^iis-/' || true)
+}
+
+iis_ready() {
+  local ready
+  ready=$(oc get deploy iis -n "$TEST_NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+  [[ "${ready:-0}" -ge 1 ]]
+}
+
+# On demand (any time, also in a second terminal during ./setup.sh - read-only)
+observe_pod() {
+  ensure_oc_login
+  oc get deploy iis -n "$TEST_NS" >/dev/null 2>&1 || die "No IIS deployment in namespace $TEST_NS yet (phase 8 creates it)."
+  local t0; t0=$(date +%s)
+  info "Observing the IIS pod every minute until it is ready (Ctrl-C to stop - this does not affect the setup)"
+  while :; do
+    pod_progress "$(( ($(date +%s) - t0) / 60 )) min"
+    iis_ready && break
+    sleep 60
+  done
+  local ip port
+  ip=$(oc get pod -n "$TEST_NS" -l app=iis -o jsonpath='{.items[0].status.hostIP}' 2>/dev/null || true)
+  port=$(oc get svc iis -n "$TEST_NS" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
+  ok "IIS pod is ready"
+  if [[ -n "$ip" && -n "$port" ]]; then
+    if curl -fs -m 10 -o /dev/null "http://$ip:$port/"; then ok "IIS responds at http://$ip:$port/"
+    else warn "Pod is ready but http://$ip:$port/ did not answer from this host"; fi
+  fi
+}
 deploy_workload() {
   phase 8 "Test IIS workload" "1-2 min + image pull (servercore is ~2GB+)"
   oc apply -f - >/dev/null <<EOF
@@ -1190,23 +1238,15 @@ EOF
   local t0 last_min=-1; t0=$(date +%s)
   local deadline=$(( t0 + WORKLOAD_TIMEOUT_MIN * 60 ))
   while :; do
-    local ready
-    ready=$(oc get deploy iis -n "$TEST_NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
-    [[ "${ready:-0}" -ge 1 ]] && break
-    (( $(date +%s) > deadline )) && {
-      hint "oc describe pod -n $TEST_NS -l app=iis"
+    iis_ready && break
+    if (( $(date +%s) > deadline )); then
+      echo "    --- oc describe pod -n $TEST_NS -l app=iis ---" >&2
+      oc describe pod -n "$TEST_NS" -l app=iis 2>&1 | sed 's/^/    /' >&2 || true
       die "IIS pod not ready within ${WORKLOAD_TIMEOUT_MIN} min."
-    }
+    fi
     local m=$(( ($(date +%s) - t0) / 60 ))
     if (( m != last_min )); then
-      local reason
-      reason=$(oc get pod -n "$TEST_NS" -l app=iis -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
-      info "${m} min elapsed - pod ${reason:-pending}"
-      if [[ "$reason" == CreateContainerConfigError || "$reason" == ErrImagePull || "$reason" == ImagePullBackOff || "$reason" == CrashLoopBackOff ]]; then
-        oc get pod -n "$TEST_NS" -l app=iis -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.message}' 2>/dev/null \
-          | sed 's/^/      /' >&2 || true
-        echo >&2
-      fi
+      pod_progress "${m} min elapsed"
       last_min=$m
     fi
     sleep 15
@@ -1346,15 +1386,18 @@ main() {
       ensure_libvirt_group "$@"
       status
       ;;
+    observe-pod)
+      observe_pod
+      ;;
     stop-windows-updates)
       ensure_libvirt_group "$@"
       stop_updates
       ;;
     -h|--help|help)
-      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"
       ;;
     *)
-      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|stop-windows-updates]"
+      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|observe-pod|stop-windows-updates]"
       ;;
   esac
 }
