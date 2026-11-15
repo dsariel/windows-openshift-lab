@@ -5,6 +5,7 @@
 #   ./setup.sh           Run the full automated setup
 #   ./setup.sh cleanup   Remove the VM and all OpenShift resources (keeps the ISO)
 #   ./setup.sh status    Show VM / node / workload status
+#   ./setup.sh health        One-shot health check of laptop, OpenShift, Windows and workload
 #   ./setup.sh observe-pod   Print the IIS pod table + new pod events every minute until ready
 #   ./setup.sh stop-windows-updates  Stop the Windows Update task on the VM if it is only searching
 #
@@ -1102,25 +1103,41 @@ EOF
 # ----------------------------------------------------------------------------
 # Phase 8: Test workload
 # ----------------------------------------------------------------------------
-declare -A SEEN_EVENTS=()
+declare -A SEEN_EVENTS=()       # event uid -> last printed count
+POD_WARNINGS=0
+EVENTS_SINCE_MIN="${EVENTS_SINCE_MIN:-15}"   # first report: only events newer than this
 
-# One progress report: the pod table plus every pod event not printed before
-# (the useful part of 'oc describe pod'). Used by phase 8 and './setup.sh observe-pod'.
+# One progress report: the pod table plus pod events that are new or repeated since
+# the last report, with their last time and count (the useful part of
+# 'oc describe pod'). The first report skips events older than EVENTS_SINCE_MIN.
+# Used by phase 8 and './setup.sh observe-pod'.
 pod_progress() {
   info "$1 - pods (oc get pods -n $TEST_NS -o wide):"
   oc get pods -n "$TEST_NS" -l app=iis -o wide 2>/dev/null | cut -c1-150 | sed 's/^/      /' || true
-  local ev uid rest ev_type ev_reason ev_obj ev_msg
-  while IFS= read -r ev; do
-    [[ -n "$ev" ]] || continue
-    uid=${ev%%|*}; rest=${ev#*|}
-    [[ -n "${SEEN_EVENTS[$uid]:-}" ]] && continue
-    SEEN_EVENTS[$uid]=1
-    IFS='|' read -r ev_type ev_reason ev_obj ev_msg <<<"$rest"
-    printf '      event: %-7s %-10s %s: %s\n' "$ev_type" "$ev_reason" "$ev_obj" "$ev_msg"
+
+  local first=0 cutoff now hidden=0
+  [[ ${#SEEN_EVENTS[@]} -eq 0 ]] && first=1
+  now=$(date -u +%s)
+  cutoff=$(( now - EVENTS_SINCE_MIN * 60 ))
+  local uid cnt ts1 ts2 ev_type ev_reason ev_obj ev_msg ts epoch age
+  while IFS='|' read -r uid cnt ts1 ts2 ev_type ev_reason ev_obj ev_msg; do
+    [[ -n "$uid" && "$ev_obj" == iis-* ]] || continue
+    cnt=${cnt:-1}
+    [[ "${SEEN_EVENTS[$uid]:-}" == "$cnt" ]] && continue
+    ts=${ts1:-$ts2}
+    epoch=$(date -u -d "$ts" +%s 2>/dev/null || echo "$now")
+    if (( first )) && (( epoch < cutoff )); then
+      SEEN_EVENTS[$uid]=$cnt; hidden=$((hidden + 1)); continue
+    fi
+    SEEN_EVENTS[$uid]=$cnt
+    [[ "$ev_type" == Warning ]] && POD_WARNINGS=1
+    age=$(( (now - epoch) / 60 ))
+    printf '      event: %4sm ago x%-3s %-7s %-22s %s: %s\n' "$age" "$cnt" "$ev_type" "$ev_reason" "$ev_obj" "$ev_msg"
   done < <(oc get events -n "$TEST_NS" --field-selector involvedObject.kind=Pod \
-             --sort-by=.metadata.creationTimestamp \
-             -o jsonpath='{range .items[*]}{.metadata.uid}{"|"}{.type}{"|"}{.reason}{"|"}{.involvedObject.name}{"|"}{.message}{"\n"}{end}' 2>/dev/null \
-           | awk -F'|' '$4 ~ /^iis-/' || true)
+             --sort-by=.lastTimestamp \
+             -o jsonpath='{range .items[*]}{.metadata.uid}{"|"}{.count}{"|"}{.lastTimestamp}{"|"}{.eventTime}{"|"}{.type}{"|"}{.reason}{"|"}{.involvedObject.name}{"|"}{.message}{"\n"}{end}' 2>/dev/null || true)
+  (( hidden > 0 )) && info "  ($hidden events older than ${EVENTS_SINCE_MIN} min not shown; EVENTS_SINCE_MIN=600 to see them)"
+  return 0
 }
 
 iis_ready() {
@@ -1135,9 +1152,14 @@ observe_pod() {
   oc get deploy iis -n "$TEST_NS" >/dev/null 2>&1 || die "No IIS deployment in namespace $TEST_NS yet (phase 8 creates it)."
   local t0; t0=$(date +%s)
   info "Observing the IIS pod every minute until it is ready (Ctrl-C to stop - this does not affect the setup)"
+  local hinted=0
   while :; do
     pod_progress "$(( ($(date +%s) - t0) / 60 )) min"
     iis_ready && break
+    if (( ! hinted && POD_WARNINGS )); then
+      info "Warnings above - for a full laptop/OpenShift/Windows check run: ./setup.sh health"
+      hinted=1
+    fi
     sleep 60
   done
   local ip port
@@ -1266,6 +1288,219 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
+# Health check (./setup.sh health): one snapshot of laptop, OpenShift, Windows, workload
+# ----------------------------------------------------------------------------
+H_FAIL=0; H_WARN=0
+h_section() { echo; echo "${C_B}$1${C_0}"; }
+h_line() {  # status(ok|warn|fail|info) name detail
+  local icon
+  case "$1" in
+    ok)   icon="${C_G}✔${C_0}" ;;
+    warn) icon="${C_Y}⚠${C_0}"; H_WARN=$((H_WARN + 1)) ;;
+    fail) icon="${C_R}✘${C_0}"; H_FAIL=$((H_FAIL + 1)) ;;
+    *)    icon="${C_C}•${C_0}" ;;
+  esac
+  printf '  %s %-34s %s\n' "$icon" "$2" "$3"
+}
+h_free_gb() { df -Pk "$1" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}'; }
+h_disk() {  # path label
+  [[ -d "$1" ]] || return 0
+  local gb; gb=$(h_free_gb "$1")
+  if   (( gb < 10 )); then h_line fail "$2" "${gb}GB free ($1)"
+  elif (( gb < 25 )); then h_line warn "$2" "${gb}GB free ($1)"
+  else h_line ok "$2" "${gb}GB free ($1)"; fi
+}
+
+# All Windows checks in one SSH round trip; prints key=value lines
+h_windows_probe() {  # api_host api_port
+  cat > "$WORK_DIR/wmco-health.ps1" <<'PSEOF'
+param([string]$ApiHost, [int]$ApiPort)
+$ErrorActionPreference = 'SilentlyContinue'
+$v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+"build=$($v.CurrentBuild).$($v.UBR)"
+$os = Get-CimInstance Win32_OperatingSystem
+"lastboot=$($os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm'))"
+"mem_free_mb=$([math]::Round($os.FreePhysicalMemory/1024))"
+$pr = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
+      (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+"pending_reboot=$pr"
+$t = schtasks /Query /TN wmco-wu /FO CSV /NH 2>$null
+"wu_task=$(if ($t) { ($t -split '","')[2].Trim('"') } else { 'none' })"
+$l = Get-Content C:\wmco-wu.log -Tail 1
+"wu_last=$(if ($l) { $l.Substring([math]::Min(20, $l.Length)) } else { '' })"
+$d = Get-Disk -Number 0
+"disk_readonly=$($d.IsReadOnly)"
+"disk_status=$($d.OperationalStatus)"
+"c_free_gb=$([math]::Round((Get-Volume -DriveLetter C).SizeRemaining / 1GB, 1))"
+foreach ($s in 'containerd', 'kubelet', 'hybrid-overlay-node', 'kube-proxy') {
+  $x = Get-Service $s
+  "svc_$s=$(if ($x) { $x.Status } else { 'missing' })"
+}
+"hns_overlay=$([bool](hnsdiag list networks 2>$null | Select-String 'OVNKubernetesHybridOverlayNetwork'))"
+$ok = $false
+try { $tc = New-Object Net.Sockets.TcpClient; $ok = $tc.ConnectAsync($ApiHost, $ApiPort).Wait(3000); $tc.Close() } catch { }
+"api_reachable=$ok"
+PSEOF
+  scp "${SSH_OPTS[@]}" -q "$WORK_DIR/wmco-health.ps1" "Administrator@$WIN_IP:C:/wmco-health.ps1" 2>/dev/null || return 1
+  win_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\wmco-health.ps1 $1 $2" 2>/dev/null | tr -d '\r'
+}
+
+health() {
+  mkdir -p "$WORK_DIR"
+  echo "${C_B}WMCO lab health check${C_0}  ($(date '+%Y-%m-%d %H:%M'))"
+
+  # ---------------- Laptop ----------------
+  h_section "Laptop"
+  h_disk "$IMG_DIR" "Disk (VM images)"
+  h_disk "$HOME/.crc" "Disk (crc)"
+  local avail_mb; avail_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+  if   (( avail_mb < 1024 )); then h_line fail "Memory" "${avail_mb}MB available"
+  elif (( avail_mb < 2048 )); then h_line warn "Memory" "${avail_mb}MB available"
+  else h_line ok "Memory" "$((avail_mb / 1024))GB available"; fi
+  local load cpus; load=$(cut -d' ' -f1 /proc/loadavg); cpus=$(nproc)
+  if awk -v l="$load" -v c="$cpus" 'BEGIN {exit !(l > 2 * c)}'; then h_line warn "CPU load" "$load (1 min) on $cpus CPUs"
+  else h_line ok "CPU load" "$load (1 min) on $cpus CPUs"; fi
+  local nets; nets=$(virsh_ net-list --name 2>/dev/null || true)
+  local net=${LIBVIRT_NET:-}
+  [[ -z "$net" && -z "$BRIDGE" ]] && { grep -qx crc <<<"$nets" && net=crc || net=default; }
+  if [[ -n "$BRIDGE" ]]; then
+    ip link show "$BRIDGE" >/dev/null 2>&1 && h_line ok "Network" "bridge $BRIDGE" || h_line fail "Network" "bridge $BRIDGE missing"
+  elif grep -qx "$net" <<<"$nets"; then h_line ok "Network" "libvirt '$net' active"
+  else h_line fail "Network" "libvirt '$net' not active"; fi
+  local st
+  if command -v crc >/dev/null; then
+    st=$(virsh_ domstate crc 2>/dev/null | head -1 || true)
+    [[ "$st" == running ]] && h_line ok "VM crc" "running" || h_line fail "VM crc" "${st:-not defined}"
+  fi
+  st=$(virsh_ domstate "$VM_NAME" 2>/dev/null | head -1 || true)
+  [[ "$st" == running ]] && h_line ok "VM $VM_NAME" "running" || h_line fail "VM $VM_NAME" "${st:-not defined}"
+  if [[ "$st" == running ]]; then
+    local be; be=$(virsh_ domblkerror "$VM_NAME" 2>/dev/null || true)
+    [[ -z "$be" || "$be" == *"No errors"* ]] && h_line ok "VM disk errors" "none" || h_line fail "VM disk errors" "$be"
+  fi
+
+  # ---------------- OpenShift ----------------
+  h_section "OpenShift"
+  local logged_in=0
+  if command -v crc >/dev/null; then
+    local cs os ram
+    cs=$(crc_field crcStatus); os=$(crc_field openshiftStatus); ram=$(crc_field ramUsage)
+    if [[ "$os" == Running ]]; then h_line ok "crc" "VM $cs, OpenShift $os, RAM $(( ${ram:-0} / 1024 / 1024 / 1024 ))GB in use"
+    elif [[ "$cs" == Running && "$ram" =~ ^[0-9]+$ ]] && (( ram > 0 && ram < 2 * 1024 * 1024 * 1024 )); then
+      h_line fail "crc" "VM running but OpenShift '$os' with $(( ram / 1024 / 1024 ))MB RAM - run: crc stop && crc start"
+    else h_line fail "crc" "VM ${cs:-?}, OpenShift ${os:-?}"; fi
+  fi
+  if oc whoami >/dev/null 2>&1 || { (ensure_oc_login) >/dev/null 2>&1 && oc whoami >/dev/null 2>&1; }; then
+    logged_in=1
+    h_line ok "oc login" "$(oc whoami) @ $(oc whoami --show-server)"
+  else
+    h_line fail "oc login" "not logged in"
+  fi
+  local want=""
+  if (( logged_in )); then
+    local cv; cv=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || true)
+    h_line info "Cluster version" "${cv:-unknown}"
+    local bad
+    bad=$(oc get co -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Available")].status}{" "}{.status.conditions[?(@.type=="Degraded")].status}{"\n"}{end}' 2>/dev/null \
+          | awk '$2 != "True" || $3 == "True" {printf "%s%s", sep, $1; sep=", "}' || true)
+    [[ -z "$bad" ]] && h_line ok "Cluster operators" "all available, none degraded" || h_line warn "Cluster operators" "not healthy: $bad"
+    local name ready
+    while read -r name ready; do
+      [[ -n "$name" ]] || continue
+      [[ "$ready" == True ]] && h_line ok "Node $name" "Ready" || h_line fail "Node $name" "Ready=$ready"
+    done < <(oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null || true)
+    local ho; ho=$(oc get network.operator cluster -o jsonpath='{.spec.defaultNetwork.ovnKubernetesConfig.hybridOverlayConfig}' 2>/dev/null || true)
+    [[ -n "$ho" ]] && h_line ok "Hybrid overlay" "configured" || h_line fail "Hybrid overlay" "not configured"
+    local csv phase_
+    csv=$(oc get subscription -n "$WMCO_NS" windows-machine-config-operator -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)
+    phase_=$( [[ -n "$csv" ]] && oc get csv -n "$WMCO_NS" "$csv" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    [[ "$phase_" == Succeeded ]] && h_line ok "WMCO operator" "$csv" || h_line fail "WMCO operator" "${csv:-not installed} ${phase_}"
+    local inst; inst=$(oc get cm windows-instances -n "$WMCO_NS" -o jsonpath='{.data}' 2>/dev/null || true)
+    [[ -n "$inst" ]] && h_line ok "windows-instances" "$inst" || h_line warn "windows-instances" "ConfigMap missing"
+    [[ -z "${WIN_IP:-}" && "$inst" =~ \"([0-9.]+)\" ]] && WIN_IP=${BASH_REMATCH[1]}
+  fi
+
+  # ---------------- Windows ----------------
+  h_section "Windows ($VM_NAME)"
+  [[ -z "${WIN_IP:-}" ]] && vm_exists && WIN_IP=$(discover_ip || true)
+  want=$(image_ubr)
+  if [[ -z "${WIN_IP:-}" ]]; then
+    h_line fail "IP address" "unknown (VM not running or no DHCP lease)"
+  elif ! win_ssh "echo ok" >/dev/null 2>&1; then
+    h_line fail "SSH" "Administrator@$WIN_IP not reachable"
+  else
+    h_line ok "SSH" "Administrator@$WIN_IP"
+    local api host port probe
+    api=$( (( logged_in )) && oc get infrastructure cluster -o jsonpath='{.status.apiServerInternalURI}' 2>/dev/null || echo "https://api-int.crc.testing:6443")
+    host=${api#https://}; port=${host##*:}; host=${host%%:*}
+    probe=$(h_windows_probe "$host" "$port" || true)
+    pv() { sed -n "s/^$1=//p" <<<"$probe" | head -1; }
+    local b ubr; b=$(pv build); ubr=${b##*.}
+    if [[ -n "$want" && "$ubr" =~ ^[0-9]+$ ]] && (( ubr >= want )); then h_line ok "Windows build" "$b (image needs .$want)"
+    elif [[ -n "$want" ]]; then h_line fail "Windows build" "$b older than image build .$want - run ./setup.sh (phase 6)"
+    else h_line warn "Windows build" "$b (image build unknown)"; fi
+    h_line info "Last boot" "$(pv lastboot)"
+    local mf; mf=$(pv mem_free_mb)
+    [[ "${mf:-0}" =~ ^[0-9]+$ ]] && (( mf < 512 )) && h_line warn "Memory" "${mf}MB free" || h_line ok "Memory" "${mf:-?}MB free"
+    [[ "$(pv pending_reboot)" == True ]] && h_line warn "Pending reboot" "yes - Windows Update needs a restart" || h_line ok "Pending reboot" "no"
+    local wt; wt=$(pv wu_task)
+    if [[ "$wt" == Running ]]; then h_line warn "Windows Update task" "running: $(pv wu_last)  (./setup.sh stop-windows-updates)"
+    else h_line ok "Windows Update task" "${wt:-none} (not running)"; fi
+    [[ "$(pv disk_readonly)" == False && "$(pv disk_status)" == Online ]] && h_line ok "Disk" "writable, $(pv disk_status)" \
+      || h_line fail "Disk" "read-only=$(pv disk_readonly) status=$(pv disk_status)"
+    local cf; cf=$(pv c_free_gb); cf=${cf%%.*}
+    if   [[ "$cf" =~ ^[0-9]+$ ]] && (( cf < 5 ));  then h_line fail "C: free" "${cf}GB"
+    elif [[ "$cf" =~ ^[0-9]+$ ]] && (( cf < 10 )); then h_line warn "C: free" "${cf}GB"
+    else h_line ok "C: free" "${cf:-?}GB"; fi
+    local svc sv
+    for svc in containerd kubelet hybrid-overlay-node kube-proxy; do
+      sv=$(pv "svc_$svc")
+      [[ "$sv" == Running ]] && h_line ok "Service $svc" "Running" || h_line fail "Service $svc" "${sv:-unknown}"
+    done
+    [[ "$(pv hns_overlay)" == True ]] && h_line ok "Pod network (HNS)" "OVNKubernetesHybridOverlayNetwork present" \
+      || h_line fail "Pod network (HNS)" "OVNKubernetesHybridOverlayNetwork missing (normal for a few min after reboot)"
+    [[ "$(pv api_reachable)" == True ]] && h_line ok "Cluster API from Windows" "$host:$port reachable" \
+      || h_line fail "Cluster API from Windows" "$host:$port not reachable"
+  fi
+
+  # ---------------- Workload ----------------
+  h_section "Workload ($TEST_NS)"
+  if (( logged_in )) && oc get deploy iis -n "$TEST_NS" >/dev/null 2>&1; then
+    iis_ready && h_line ok "IIS deployment" "ready" || h_line fail "IIS deployment" "not ready"
+    oc get pods -n "$TEST_NS" -l app=iis -o wide 2>/dev/null | cut -c1-150 | sed 's/^/      /' || true
+    local cutoff warn_lines
+    cutoff=$(( $(date -u +%s) - 15 * 60 ))
+    warn_lines=$(oc get events -n "$TEST_NS" --field-selector type=Warning --sort-by=.lastTimestamp \
+        -o jsonpath='{range .items[*]}{.lastTimestamp}{"|"}{.count}{"|"}{.reason}{"|"}{.involvedObject.name}{"|"}{.message}{"\n"}{end}' 2>/dev/null \
+      | while IFS='|' read -r ts cnt reason obj msg; do
+          [[ -n "$ts" ]] || continue
+          (( $(date -u -d "$ts" +%s 2>/dev/null || echo 0) >= cutoff )) || continue
+          printf '      %s x%s %s %s: %s\n' "${ts#*T}" "${cnt:-1}" "$reason" "$obj" "$msg" | cut -c1-240
+        done || true)
+    if [[ -n "$warn_lines" ]]; then
+      h_line warn "Warning events (15 min)" "$(grep -c . <<<"$warn_lines")"
+      tail -5 <<<"$warn_lines"
+    else
+      h_line ok "Warning events (15 min)" "none"
+    fi
+    local port ip
+    port=$(oc get svc iis -n "$TEST_NS" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
+    ip=${WIN_IP:-}
+    if [[ -n "$port" && -n "$ip" ]]; then
+      curl -fs -m 10 -o /dev/null "http://$ip:$port/" && h_line ok "IIS HTTP" "http://$ip:$port/ responds" \
+        || h_line fail "IIS HTTP" "http://$ip:$port/ no response"
+    fi
+  else
+    h_line info "IIS deployment" "not deployed yet"
+  fi
+
+  echo
+  if (( H_FAIL )); then echo "${C_R}${C_B}Health: $H_FAIL failed, $H_WARN warnings${C_0}"; return 1
+  elif (( H_WARN )); then echo "${C_Y}${C_B}Health: OK with $H_WARN warnings${C_0}"
+  else echo "${C_G}${C_B}Health: all checks passed${C_0}"; fi
+}
+
+# ----------------------------------------------------------------------------
 # Summary / status
 # ----------------------------------------------------------------------------
 summary() {
@@ -1389,6 +1624,10 @@ main() {
     observe-pod)
       observe_pod
       ;;
+    health)
+      ensure_libvirt_group "$@"
+      health
+      ;;
     stop-windows-updates)
       ensure_libvirt_group "$@"
       stop_updates
@@ -1397,7 +1636,7 @@ main() {
       awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"
       ;;
     *)
-      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|observe-pod|stop-windows-updates]"
+      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|health|observe-pod|stop-windows-updates]"
       ;;
   esac
 }
