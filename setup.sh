@@ -7,6 +7,7 @@
 #   ./setup.sh status    Show VM / node / workload status
 #   ./setup.sh health        One-shot health check of laptop, OpenShift, Windows and workload
 #   ./setup.sh diagnose-windows  Container runtime diagnostics on the Windows node (read-only)
+#   ./setup.sh reset-containerd  Move containerd storage aside on the Windows node; images re-download
 #   ./setup.sh observe-pod   Print the IIS pod table + new pod events every minute until ready
 #   ./setup.sh stop-windows-updates  Stop the Windows Update task on the VM if it is only searching
 #
@@ -61,6 +62,7 @@ HYBRID_HOST_PREFIX="${HYBRID_HOST_PREFIX:-23}"
 # Test workload
 TEST_NS="${TEST_NS:-wmco-test}"
 IIS_IMAGE="${IIS_IMAGE:-mcr.microsoft.com/windows/servercore/iis:windowsservercore-ltsc2025}"
+FORCE="${FORCE:-0}"                                    # 1 = skip confirmation prompts (reset-containerd)
 WIN_UPDATE="${WIN_UPDATE:-1}"                          # 1 = install Windows updates so the host matches the image build
 WU_SEARCH_TIMEOUT_MIN="${WU_SEARCH_TIMEOUT_MIN:-30}"   # abort a hung update *search* (read-only; never download/install)
 
@@ -1373,6 +1375,98 @@ PSEOF
 }
 
 # ----------------------------------------------------------------------------
+# Reset containerd storage on the Windows node (./setup.sh reset-containerd)
+# Moves the storage folder aside (not deleted, so it can be restored) so every image
+# is downloaded and unpacked fresh - e.g. after layers unpacked on an older Windows
+# build fail with "hcsshim::PrepareLayer ... unrecognized format (0xc0370112)".
+# ----------------------------------------------------------------------------
+reset_containerd() {
+  mkdir -p "$WORK_DIR"
+  vm_exists || die "VM '$VM_NAME' does not exist."
+  WIN_IP="${WIN_IP:-$(discover_ip || true)}"
+  [[ -n "$WIN_IP" ]] || die "Could not find the VM's IP address (set WIN_IP=...)."
+  win_ssh "echo ok" >/dev/null 2>&1 || die "Cannot SSH to Administrator@$WIN_IP."
+  ensure_oc_login
+
+  echo "${C_B}Reset containerd storage on $VM_NAME ($WIN_IP)${C_0}"
+  info "Moves C:\\ProgramData\\containerd\\root aside (kept as root.bad-<time>) and restarts containerd + kubelet."
+  info "All images on the node are downloaded again (IIS is ~2.4GB, ~15 min)."
+  if [[ "$FORCE" != "1" ]]; then
+    [[ -t 0 ]] || die "Not interactive - run with FORCE=1 to confirm."
+    local answer; read -r -p "    Continue? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { info "Aborted"; return 0; }
+  fi
+
+  # 1. Nothing may use the images while the storage is moved
+  local replicas=""
+  if oc get deploy iis -n "$TEST_NS" >/dev/null 2>&1; then
+    replicas=$(oc get deploy iis -n "$TEST_NS" -o jsonpath='{.spec.replicas}')
+    [[ "$replicas" =~ ^[0-9]+$ ]] && (( replicas > 0 )) || replicas=1
+    oc scale deploy iis -n "$TEST_NS" --replicas=0 >/dev/null
+    info "Scaled IIS to 0 (was $replicas); waiting for its pods to go away"
+    local t0; t0=$(date +%s)
+    while [[ -n "$(oc get pods -n "$TEST_NS" -l app=iis -o name 2>/dev/null)" ]]; do
+      if (( $(date +%s) - t0 > 300 )); then
+        warn "IIS pods still present after 5 min - force-deleting them"
+        oc delete pods -n "$TEST_NS" -l app=iis --force --grace-period=0 >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 5
+    done
+    ok "IIS pods gone"
+  fi
+
+  # 2. Stop services, move the storage folder aside, start services
+  cat > "$WORK_DIR/wmco-reset-containerd.ps1" <<'PSEOF'
+$ErrorActionPreference = 'Stop'
+$conf = Get-Content C:\k\containerd\containerd_conf.toml -Raw
+$root = [regex]::Match($conf, '(?m)^\s*root\s*=\s*"([^"]+)"').Groups[1].Value -replace '\\\\', '\'
+if (-not $root) { $root = 'C:\ProgramData\containerd\root' }
+"containerd root: $root"
+Stop-Service kubelet -Force
+Stop-Service containerd -Force
+if (Test-Path $root) {
+  $leaf = (Split-Path $root -Leaf) + '.bad-' + (Get-Date -Format yyyyMMddHHmmss)
+  Rename-Item -Path $root -NewName $leaf
+  "moved aside to: $(Join-Path (Split-Path $root) $leaf)"
+} else { "root folder not present - nothing to move" }
+Start-Service containerd
+Start-Service kubelet
+Get-Service containerd, kubelet | ForEach-Object { "service $($_.Name): $($_.Status)" }
+PSEOF
+  scp "${SSH_OPTS[@]}" -q "$WORK_DIR/wmco-reset-containerd.ps1" "Administrator@$WIN_IP:C:/wmco-reset-containerd.ps1" \
+    || die "Could not copy the reset script to the VM."
+  local out
+  if ! out=$(win_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\wmco-reset-containerd.ps1" 2>&1 | tr -d '\r'); then
+    sed 's/^/      /' <<<"$out" >&2
+    hint "Make sure the services run again: ssh -i $SSH_KEY Administrator@$WIN_IP powershell Start-Service containerd,kubelet"
+    die "Resetting containerd failed."
+  fi
+  sed 's/^/      /' <<<"$out"
+  grep -q 'service containerd: Running' <<<"$out" && grep -q 'service kubelet: Running' <<<"$out" \
+    || die "containerd/kubelet are not running after the reset."
+  ok "containerd storage reset"
+
+  # 3. Node Ready again, then bring IIS back
+  local node t0
+  node=$(oc get nodes -l kubernetes.io/os=windows -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [[ -n "$node" ]]; then
+    t0=$(date +%s)
+    until [[ "$(oc get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == True ]]; do
+      (( $(date +%s) - t0 > 300 )) && { warn "Node $node not Ready after 5 min"; break; }
+      sleep 10
+    done
+    ok "Node $node Ready"
+  fi
+  if [[ -n "$replicas" ]]; then
+    oc scale deploy iis -n "$TEST_NS" --replicas="$replicas" >/dev/null
+    ok "Scaled IIS back to $replicas"
+    info "Watch it come up: ./setup.sh observe-pod"
+  fi
+  info "The old storage folder can be deleted once IIS works (shown by ./setup.sh diagnose-windows)."
+}
+
+# ----------------------------------------------------------------------------
 # Health check (./setup.sh health): one snapshot of laptop, OpenShift, Windows, workload
 # ----------------------------------------------------------------------------
 H_FAIL=0; H_WARN=0
@@ -1566,7 +1660,7 @@ health() {
       h_line warn "Warning events (15 min)" "$(grep -c . <<<"$warn_lines")"
       tail -5 <<<"$warn_lines"
       if grep -qE 'PrepareLayer|hcs::|hcsshim|0xc037' <<<"$warn_lines"; then
-        h_line info "Container runtime errors" "details: ./setup.sh diagnose-windows"
+        h_line info "Container runtime errors" "details: ./setup.sh diagnose-windows; layer errors: ./setup.sh reset-containerd"
       fi
     else
       h_line ok "Warning events (15 min)" "none"
@@ -1720,6 +1814,10 @@ main() {
       ensure_libvirt_group "$@"
       diagnose_windows
       ;;
+    reset-containerd)
+      ensure_libvirt_group "$@"
+      reset_containerd
+      ;;
     stop-windows-updates)
       ensure_libvirt_group "$@"
       stop_updates
@@ -1728,7 +1826,7 @@ main() {
       awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"
       ;;
     *)
-      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|health|diagnose-windows|observe-pod|stop-windows-updates]"
+      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|health|diagnose-windows|reset-containerd|observe-pod|stop-windows-updates]"
       ;;
   esac
 }
