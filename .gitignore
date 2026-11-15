@@ -2,3 +2,4 @@
 .wmco-work/
 *.iso
 *.qcow2
+pull-secret*

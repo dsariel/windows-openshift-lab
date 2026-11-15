@@ -27,7 +27,9 @@ WIN_IMAGE_INDEX="${WIN_IMAGE_INDEX:-2}"                # 2 = Standard Evaluation
 
 # Libvirt
 LIBVIRT_URI="${LIBVIRT_URI:-qemu:///system}"
-LIBVIRT_NET="${LIBVIRT_NET:-default}"                  # NAT network (used when BRIDGE is empty)
+LIBVIRT_NET="${LIBVIRT_NET:-}"                         # empty = "crc" if it exists (setup-cluster.sh), else "default"
+WIN_MAC="${WIN_MAC:-52:54:00:57:4d:43}"                # fixed MAC so the DHCP reservation can be made before boot
+WIN_STATIC_HOST="${WIN_STATIC_HOST:-50}"               # last octet reserved for Windows on networks without a DHCP range
 BRIDGE="${BRIDGE:-}"                                   # e.g. br0 -> VM on your LAN (recommended for remote clusters)
 IMG_DIR="${IMG_DIR:-/var/lib/libvirt/images}"
 
@@ -108,16 +110,19 @@ win_ps()  { win_ssh "powershell -NoProfile -NonInteractive -Command \"$1\""; }
 # Phase 1: Prerequisites
 # ----------------------------------------------------------------------------
 ensure_libvirt_group() {
-  # Already effective in this shell?
-  if id -nG | tr ' ' '\n' | grep -qx libvirt || [[ $EUID -eq 0 ]]; then return; fi
-  if ! getent group libvirt | grep -qw "$USER"; then
-    info "Adding $USER to the libvirt group (sudo)"
-    sudo usermod -aG libvirt "$USER"
+  # Already have access (group active, root, or polkit)?
+  if [[ $EUID -eq 0 ]] || virsh -q -c "$LIBVIRT_URI" list >/dev/null 2>&1; then return; fi
+  command -v virsh >/dev/null || return   # packages get installed in phase 1
+  local grp=libvirt
+  getent group libvirt >/dev/null || grp=libvirtd
+  if ! id -nG "$USER" | tr ' ' '\n' | grep -qx "$grp"; then
+    info "Adding $USER to the $grp group (sudo)"
+    sudo usermod -aG "$grp" "$USER"
   fi
   if [[ -z "${WMCO_SG_REEXEC:-}" ]]; then
-    info "Re-executing with the libvirt group active"
+    info "Re-executing with the $grp group active"
     export WMCO_SG_REEXEC=1
-    exec sg libvirt -c "$(printf '%q ' "$0" "$@")"
+    exec sg "$grp" -c "$(printf '%q ' "$0" "$@")"
   fi
   die "Could not activate libvirt group membership. Log out/in and run again."
 }
@@ -149,7 +154,7 @@ install_packages() {
 check_prereqs() {
   phase 1 "Prerequisites" "<1 min"
   install_packages
-  command -v oc >/dev/null || die "'oc' not found in PATH. Install the OpenShift CLI first."
+  command -v oc >/dev/null || die "'oc' not found in PATH. Run ./setup-cluster.sh or install the OpenShift CLI."
   [[ -e /dev/kvm ]] || die "/dev/kvm not present - enable hardware virtualization in BIOS."
 
   if ! systemctl is-active --quiet libvirtd && ! systemctl is-active --quiet virtqemud; then
@@ -159,12 +164,18 @@ check_prereqs() {
   virsh_ list >/dev/null || die "Cannot connect to $LIBVIRT_URI"
   ok "libvirt reachable ($LIBVIRT_URI)"
 
-  oc whoami >/dev/null 2>&1 || die "oc is not logged in. Run 'oc login ...' as cluster-admin."
+  if ! oc whoami >/dev/null 2>&1; then
+    hint "No cluster? ./setup-cluster.sh creates a local OpenShift cluster and logs you in."
+    die "oc is not logged in. Run 'oc login ...' as cluster-admin."
+  fi
   oc auth can-i '*' '*' --all-namespaces >/dev/null 2>&1 || die "Current oc user ($(oc whoami)) is not cluster-admin."
   ok "OpenShift: $(oc whoami) @ $(oc whoami --show-server)"
 
   check_hybrid_overlay
 
+  if [[ -z "$BRIDGE" && -z "$LIBVIRT_NET" ]]; then
+    if virsh_ net-info crc >/dev/null 2>&1; then LIBVIRT_NET=crc; else LIBVIRT_NET=default; fi
+  fi
   if [[ -z "$BRIDGE" ]]; then
     if ! virsh_ net-info "$LIBVIRT_NET" >/dev/null 2>&1; then
       die "libvirt network '$LIBVIRT_NET' not found (set LIBVIRT_NET or BRIDGE)."
@@ -174,8 +185,10 @@ check_prereqs() {
     fi
     virsh_ net-autostart "$LIBVIRT_NET" >/dev/null
     ok "Network: libvirt NAT network '$LIBVIRT_NET'"
-    warn "NAT networking: the cluster must be able to reach the VM (works when the cluster runs on this host)."
-    hint "For a remote cluster use a bridge: BRIDGE=br0 ./setup.sh"
+    if [[ "$LIBVIRT_NET" != "crc" ]]; then
+      warn "The cluster must be able to reach the VM on '$LIBVIRT_NET' (works when the cluster runs on this host)."
+      hint "For a remote cluster use a bridge: BRIDGE=br0 ./setup.sh"
+    fi
   else
     ip link show "$BRIDGE" >/dev/null 2>&1 || die "Bridge '$BRIDGE' does not exist on this host."
     ok "Network: bridge $BRIDGE"
@@ -435,8 +448,8 @@ create_vm() {
   build_config_iso
 
   local net_arg
-  if [[ -n "$BRIDGE" ]]; then net_arg="bridge=$BRIDGE,model=e1000e"
-  else net_arg="network=$LIBVIRT_NET,model=e1000e"; fi
+  if [[ -n "$BRIDGE" ]]; then net_arg="bridge=$BRIDGE,model=e1000e,mac=$WIN_MAC"
+  else net_arg="network=$LIBVIRT_NET,model=e1000e,mac=$WIN_MAC"; prereserve_dhcp; fi
 
   info "Creating VM: ${VM_CPUS} vCPU, $((VM_RAM_MB/1024))GB RAM, ${VM_DISK_GB}GB disk"
   # SATA disk + e1000e NIC use in-box Windows drivers (no virtio ISO needed).
@@ -477,6 +490,21 @@ discover_ip() {
     ip=$(ip neigh | awk -v m="$mac" 'tolower($5)==tolower(m) && $1 ~ /\./ {print $1; exit}')
     [[ -n "$ip" ]] && echo "$ip"
   fi
+}
+
+# Networks without a DHCP range (e.g. crc's) only hand out reserved addresses,
+# so reserve one for our fixed MAC before the VM boots.
+prereserve_dhcp() {
+  local xml gw ip
+  xml=$(virsh_ net-dumpxml "$LIBVIRT_NET")
+  grep -q "mac='$WIN_MAC'" <<<"$xml" && return
+  grep -q "<range" <<<"$xml" && return
+  gw=$(grep -o "<ip [^>]*address='[0-9.]*'" <<<"$xml" | head -1 | grep -o "[0-9.]*'$" | tr -d "'")
+  [[ -n "$gw" ]] || die "Cannot read the IPv4 subnet of libvirt network '$LIBVIRT_NET'."
+  ip="${gw%.*}.$WIN_STATIC_HOST"
+  virsh_ net-update "$LIBVIRT_NET" add ip-dhcp-host \
+    "<host mac='$WIN_MAC' name='$WIN_HOSTNAME' ip='$ip'/>" --live --config >/dev/null
+  ok "Reserved $ip for the Windows VM on network '$LIBVIRT_NET'"
 }
 
 reserve_dhcp() {
@@ -563,8 +591,20 @@ wait_for_access() {
   local api host port
   api=$(oc get infrastructure cluster -o jsonpath='{.status.apiServerInternalURI}')
   host=${api#https://}; port=${host##*:}; host=${host%%:*}
-  if win_ps "if ((Test-NetConnection -ComputerName '$host' -Port $port -WarningAction SilentlyContinue).TcpTestSucceeded) { 'ok' }" \
-       2>/dev/null | grep -q ok; then
+  local test_cmd="if ((Test-NetConnection -ComputerName '$host' -Port $port -WarningAction SilentlyContinue).TcpTestSucceeded) { 'ok' }"
+  if ! win_ps "$test_cmd" 2>/dev/null | grep -q ok; then
+    # Names like api-int.crc.testing resolve on this host (NetworkManager dnsmasq)
+    # but not inside the VM: pin them in the Windows hosts file.
+    local ext name addr
+    ext=$(oc whoami --show-server); ext=${ext#https://}; ext=${ext%%:*}
+    for name in "$host" "$ext"; do
+      addr=$(getent ahostsv4 "$name" | awk '{print $1; exit}')
+      [[ -n "$addr" ]] || continue
+      win_ps "Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value '$addr $name'" >/dev/null 2>&1 \
+        && info "Added '$addr $name' to the Windows hosts file"
+    done
+  fi
+  if win_ps "$test_cmd" 2>/dev/null | grep -q ok; then
     ok "Windows can reach $host:$port"
   else
     warn "Windows cannot reach the internal API ($host:$port). The node will not be able to join."
