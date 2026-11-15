@@ -6,6 +6,7 @@
 #   ./setup.sh cleanup   Remove the VM and all OpenShift resources (keeps the ISO)
 #   ./setup.sh status    Show VM / node / workload status
 #   ./setup.sh health        One-shot health check of laptop, OpenShift, Windows and workload
+#   ./setup.sh diagnose-windows  Container runtime diagnostics on the Windows node (read-only)
 #   ./setup.sh observe-pod   Print the IIS pod table + new pod events every minute until ready
 #   ./setup.sh stop-windows-updates  Stop the Windows Update task on the VM if it is only searching
 #
@@ -1288,6 +1289,90 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
+# Windows container runtime diagnostics (./setup.sh diagnose-windows)
+# Read-only, except that crictl is installed into C:\k\tools if missing.
+# ----------------------------------------------------------------------------
+diagnose_windows() {
+  mkdir -p "$WORK_DIR"
+  vm_exists || die "VM '$VM_NAME' does not exist."
+  WIN_IP="${WIN_IP:-$(discover_ip || true)}"
+  [[ -n "$WIN_IP" ]] || die "Could not find the VM's IP address (set WIN_IP=...)."
+  win_ssh "echo ok" >/dev/null 2>&1 || die "Cannot SSH to Administrator@$WIN_IP."
+
+  # crictl matching the node's Kubernetes minor (kubelet v1.35.5 -> crictl v1.35.0)
+  local kv crictl_ver="v1.35.0"
+  if oc whoami >/dev/null 2>&1 || { (ensure_oc_login) >/dev/null 2>&1 && oc whoami >/dev/null 2>&1; }; then
+    kv=$(oc get nodes -l kubernetes.io/os=windows -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null || true)
+    [[ "$kv" =~ ^(v[0-9]+\.[0-9]+)\. ]] && crictl_ver="${BASH_REMATCH[1]}.0"
+  fi
+
+  cat > "$WORK_DIR/wmco-diag.ps1" <<'PSEOF'
+param([string]$CrictlVersion)
+$ErrorActionPreference = 'SilentlyContinue'
+function H($t) { ''; "=== $t ===" }
+
+H 'Windows'
+$v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+"Build: $($v.CurrentBuild).$($v.UBR)   Last boot: $((Get-CimInstance Win32_OperatingSystem).LastBootUpTime)"
+"Containers feature: $((Get-WindowsFeature Containers).InstallState)"
+
+H 'Container filter drivers (fltmc)'
+fltmc | Select-String 'wcifs|bindflt|UnionFS|Filter Name'
+foreach ($d in 'wcifs', 'bindflt') { "{0,-8} service: {1}" -f $d, (Get-Service $d).Status }
+
+H 'Node services'
+Get-Service containerd, kubelet, hybrid-overlay-node, kube-proxy, windows_exporter | Format-Table Name, Status, StartType -AutoSize | Out-String -Width 200
+
+H 'containerd configuration'
+$confPath = 'C:\k\containerd\containerd_conf.toml'
+$conf = Get-Content $confPath -Raw
+if ($conf) {
+  Get-Content $confPath | Select-String '^\s*(root|state)\s*=|snapshotter|sandbox_image' | ForEach-Object { $_.Line.Trim() }
+} else { "not found: $confPath" }
+$root = [regex]::Match([string]$conf, '(?m)^\s*root\s*=\s*"([^"]+)"').Groups[1].Value -replace '\\\\', '\'
+if (-not $root) { $root = 'C:\ProgramData\containerd\root' }
+"root: $root"
+
+H 'containerd storage'
+$snap = Join-Path $root 'io.containerd.snapshotter.v1.windows\snapshots'
+"snapshots dir: $snap"
+"unpacked layers (snapshots): $((Get-ChildItem $snap -Directory | Measure-Object).Count)"
+"content blobs: $((Get-ChildItem (Join-Path $root 'io.containerd.content.v1.content\blobs\sha256') -File | Measure-Object).Count)"
+Get-ChildItem (Split-Path $root) -Directory | Where-Object Name -like 'root.bad-*' | ForEach-Object { "set-aside storage: $($_.FullName)" }
+
+H 'crictl images / pods'
+$crictl = 'C:\k\tools\crictl.exe'
+if (-not (Test-Path $crictl)) {
+  "installing crictl $CrictlVersion into C:\k\tools"
+  New-Item -ItemType Directory -Force C:\k\tools | Out-Null
+  $url = "https://github.com/kubernetes-sigs/cri-tools/releases/download/$CrictlVersion/crictl-$CrictlVersion-windows-amd64.tar.gz"
+  Invoke-WebRequest -UseBasicParsing $url -OutFile C:\k\tools\crictl.tgz
+  tar -xf C:\k\tools\crictl.tgz -C C:\k\tools
+}
+if (Test-Path $crictl) {
+  $ep = '--runtime-endpoint=npipe:////./pipe/containerd-containerd'
+  & $crictl $ep '--image-endpoint=npipe:////./pipe/containerd-containerd' --timeout 60s images 2>$null
+  ''
+  & $crictl $ep --timeout 60s pods 2>$null
+} else { 'crictl not available' }
+
+H 'HNS networks (hnsdiag)'
+hnsdiag list networks 2>$null
+
+H 'Recent container errors in C:\var\log (last 24h, newest 10 per file)'
+$pat = 'PrepareLayer|0xc037|hcs::|hcsshim|unpack|snapshot|failed to create shim|level=error'
+Get-ChildItem C:\var\log -Recurse -File -Include *.log, *.txt | Where-Object LastWriteTime -gt (Get-Date).AddDays(-1) | ForEach-Object {
+  $m = Select-String -Path $_.FullName -Pattern $pat | Select-Object -Last 10
+  if ($m) { "--- $($_.FullName)"; $m | ForEach-Object { $_.Line.Substring(0, [math]::Min(300, $_.Line.Length)) } }
+}
+PSEOF
+  info "Collecting container runtime diagnostics from Administrator@$WIN_IP (read-only)"
+  scp "${SSH_OPTS[@]}" -q "$WORK_DIR/wmco-diag.ps1" "Administrator@$WIN_IP:C:/wmco-diag.ps1" \
+    || die "Could not copy the diagnostics script to the VM."
+  win_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\wmco-diag.ps1 $crictl_ver" | tr -d '\r'
+}
+
+# ----------------------------------------------------------------------------
 # Health check (./setup.sh health): one snapshot of laptop, OpenShift, Windows, workload
 # ----------------------------------------------------------------------------
 H_FAIL=0; H_WARN=0
@@ -1480,6 +1565,9 @@ health() {
     if [[ -n "$warn_lines" ]]; then
       h_line warn "Warning events (15 min)" "$(grep -c . <<<"$warn_lines")"
       tail -5 <<<"$warn_lines"
+      if grep -qE 'PrepareLayer|hcs::|hcsshim|0xc037' <<<"$warn_lines"; then
+        h_line info "Container runtime errors" "details: ./setup.sh diagnose-windows"
+      fi
     else
       h_line ok "Warning events (15 min)" "none"
     fi
@@ -1628,6 +1716,10 @@ main() {
       ensure_libvirt_group "$@"
       health
       ;;
+    diagnose-windows)
+      ensure_libvirt_group "$@"
+      diagnose_windows
+      ;;
     stop-windows-updates)
       ensure_libvirt_group "$@"
       stop_updates
@@ -1636,7 +1728,7 @@ main() {
       awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"
       ;;
     *)
-      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|health|observe-pod|stop-windows-updates]"
+      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|health|diagnose-windows|observe-pod|stop-windows-updates]"
       ;;
   esac
 }
