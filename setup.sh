@@ -5,6 +5,7 @@
 #   ./setup.sh           Run the full automated setup
 #   ./setup.sh cleanup   Remove the VM and all OpenShift resources (keeps the ISO)
 #   ./setup.sh status    Show VM / node / workload status
+#   ./setup.sh stop-windows-updates  Stop the Windows Update task on the VM if it is only searching
 #
 # Every setting below can be overridden from the environment, e.g.:
 #   BRIDGE=br0 VM_RAM_MB=16384 ./setup.sh
@@ -58,6 +59,7 @@ HYBRID_HOST_PREFIX="${HYBRID_HOST_PREFIX:-23}"
 TEST_NS="${TEST_NS:-wmco-test}"
 IIS_IMAGE="${IIS_IMAGE:-mcr.microsoft.com/windows/servercore/iis:windowsservercore-ltsc2025}"
 WIN_UPDATE="${WIN_UPDATE:-1}"                          # 1 = install Windows updates so the host matches the image build
+WU_SEARCH_TIMEOUT_MIN="${WU_SEARCH_TIMEOUT_MIN:-30}"   # abort a hung update *search* (read-only; never download/install)
 
 # Timeouts (minutes)
 INSTALL_TIMEOUT_MIN="${INSTALL_TIMEOUT_MIN:-75}"
@@ -99,6 +101,9 @@ on_exit() {
     echo "  - Windows setup log:       ssh -i $SSH_KEY Administrator@$WIN_IP type C:\\wmco-setup.log" >&2
   fi
   echo "  - WMCO logs:               oc logs -n $WMCO_NS deploy/windows-machine-config-operator" >&2
+  if [[ "$CURRENT_PHASE" == "Windows updates" ]]; then
+    echo "  - Windows Update keeps running on the VM. Check/stop it safely: ./setup.sh stop-windows-updates" >&2
+  fi
   echo "  - Re-running ./setup.sh is safe; completed steps are skipped." >&2
   echo "  - Start over:              ./setup.sh cleanup && ./setup.sh" >&2
 }
@@ -762,6 +767,37 @@ host_build() {
   win_ps "\$v=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'; \$v.CurrentBuild + '.' + \$v.UBR" 2>/dev/null | tr -d '\r'
 }
 
+host_up_to_date() {  # $1 = image build revision
+  local have; have=$(host_build)
+  [[ -n "$1" && "${have##*.}" =~ ^[0-9]+$ ]] && (( ${have##*.} >= $1 ))
+}
+
+win_pending_reboot() {
+  [[ "$(win_ps "if ((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')) { 'yes' }" 2>/dev/null | tr -d '\r')" == yes ]]
+}
+
+# Graceful reboot for update rounds:
+#  - wait until Windows servicing is idle (TrustedInstaller/TiWorker finish component
+#    store work after an update; interrupting that is what can damage the system)
+#  - "shutdown /r /t 0": with /t > 0 Windows implies /f (force-close); /t 0 does not
+win_reboot() {
+  local t0 last_min=-1 busy
+  t0=$(date +%s)
+  while :; do
+    busy=$(win_ps "(Get-Process TiWorker,TrustedInstaller,msiexec -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique) -join ','" 2>/dev/null | tr -d '\r' || true)
+    [[ -z "$busy" ]] && break
+    if (( $(date +%s) - t0 > 60 * 60 )); then
+      hint "ssh -i $SSH_KEY Administrator@$WIN_IP   then: Get-Process TiWorker,TrustedInstaller"
+      die "Windows servicing ($busy) still busy after 60 min - not rebooting it from the script."
+    fi
+    local m=$(( ($(date +%s) - t0) / 60 ))
+    if (( m != last_min )); then info "  waiting for Windows servicing to finish before reboot ($busy) - ${m} min"; last_min=$m; fi
+    sleep 30
+  done
+  win_ssh "shutdown /r /t 0 /c \"WMCO setup: Windows updates\"" >/dev/null 2>&1 || true
+  wait_for_reboot
+}
+
 wait_for_reboot() {
   local t0; t0=$(date +%s)
   # down...
@@ -780,15 +816,76 @@ wait_for_reboot() {
   ok "Windows is back after reboot ($(elapsed "$t0"))"
 }
 
+# ---- Update task left over from an interrupted run -------------------------
+wu_task_state() {  # Running / Ready / ... ; empty if the task does not exist
+  win_ssh "schtasks /Query /TN wmco-wu /FO CSV /NH 2>nul" 2>/dev/null | tr -d '\r' | awk -F'","' 'NF>=3 {gsub(/"/, "", $3); print $3; exit}'
+}
+wu_last_step() {   # last line of C:\wmco-wu.log without the timestamp
+  win_ssh "type C:\\wmco-wu.log 2>nul" 2>/dev/null | tr -d '\r' | grep . | tail -1 | cut -c21-
+}
+# Only the search is read-only; download/install must be left alone
+wu_step_is_safe_to_stop() { [[ "$1" == "Searching for updates" ]]; }
+
+# Returns 0 if no update task is running anymore (stopped or not running),
+# 1 if it is downloading/installing and was left alone.
+wu_stop_if_safe() {
+  local state step
+  state=$(wu_task_state)
+  step=$(wu_last_step)
+  info "Host build: $(host_build || echo '?')   update task: ${state:-none}   last step: ${step:-none}"
+  if [[ "$state" != "Running" ]]; then ok "No Windows Update task is running"; return 0; fi
+  if wu_step_is_safe_to_stop "$step"; then
+    win_ssh "schtasks /End /TN wmco-wu" >/dev/null 2>&1 || true
+    ok "Stopped the update task (it was only searching - read-only, nothing changed on the system)"
+    return 0
+  fi
+  warn "The update task is '$step' - NOT stopping it (interrupting download/install is unsafe)"
+  return 1
+}
+
+# Called at the start of phase 6: stop a leftover search, or wait for a leftover
+# download/install to finish (and reboot if it asks for one) before doing anything else.
+wu_handle_leftover() {
+  wu_stop_if_safe && return
+  local t0 last_min=-1 status
+  t0=$(date +%s)
+  info "Waiting for the update task from the previous run to finish"
+  while [[ "$(wu_task_state)" == "Running" ]]; do
+    (( $(date +%s) - t0 > 120 * 60 )) && die "Leftover update task still running after 120 min."
+    local m=$(( ($(date +%s) - t0) / 60 ))
+    if (( m != last_min )); then info "  ${m} min - host build $(host_build || echo '?') - $(wu_last_step)"; last_min=$m; fi
+    sleep 30
+  done
+  status=$(win_ssh "type C:\\wmco-wu.status 2>nul" 2>/dev/null | tr -d '\r' || true)
+  ok "Previous update task finished: ${status:-no status}"
+  [[ "$status" == REBOOT ]] && win_reboot
+  return 0
+}
+
+stop_updates() {
+  vm_exists || die "VM '$VM_NAME' does not exist."
+  WIN_IP="${WIN_IP:-$(discover_ip || true)}"
+  [[ -n "$WIN_IP" ]] || die "Could not find the VM's IP address (set WIN_IP=...)."
+  win_ssh "echo ok" >/dev/null 2>&1 || die "Cannot SSH to Administrator@$WIN_IP."
+  if wu_stop_if_safe; then
+    ok "Safe to re-run ./setup.sh"
+  else
+    hint "Watch it:  ssh -i $SSH_KEY Administrator@$WIN_IP type C:\\wmco-wu.log"
+    hint "Or just re-run ./setup.sh - phase 6 waits for this task to finish before continuing."
+    return 1
+  fi
+}
+
 update_windows() {
   phase 6 "Windows updates" "20-60 min, one-time"
   if [[ "$WIN_UPDATE" != "1" ]]; then warn "WIN_UPDATE=$WIN_UPDATE - skipping (containers may fail to start on an outdated host)"; return; fi
+  wu_handle_leftover
 
   local want have
   want=$(image_ubr)
   have=$(host_build)
   info "Host build: ${have:-unknown}   container image ($IIS_IMAGE) build revision: ${want:-unknown}"
-  if [[ -n "$want" && "${have##*.}" =~ ^[0-9]+$ ]] && (( ${have##*.} >= want )); then
+  if host_up_to_date "$want"; then
     ok "Host is at least as new as the container image - no update needed"
     return
   fi
@@ -819,20 +916,52 @@ try {
 PSEOF
   scp "${SSH_OPTS[@]}" -q "$WORK_DIR/wmco-wu.ps1" "Administrator@$WIN_IP:C:/wmco-wu.ps1"
 
-  local round status t0 last_min
+  local round status t0 last_min line phase_since cur_phase
   for round in 1 2 3 4; do
+    # A finished cumulative update can leave servicing work that needs another reboot;
+    # searching before that reboot tends to hang.
+    if (( round > 1 )) && win_pending_reboot; then
+      info "Windows reports a pending reboot - rebooting before searching again"
+      win_reboot
+    fi
+    # Stop as soon as the host is as new as the image - more rounds are not needed
+    if (( round > 1 )) && host_up_to_date "$want"; then
+      ok "Host build $(host_build) is at least the image revision $want - done"
+      break
+    fi
+
     info "Update round $round: searching, downloading and installing (progress in C:\\wmco-wu.log)"
-    win_ssh "del /q C:\\wmco-wu.status 2>nul & schtasks /Create /F /TN wmco-wu /RU SYSTEM /RL HIGHEST /SC ONCE /ST 00:00 /TR \"powershell -NoProfile -ExecutionPolicy Bypass -File C:\\wmco-wu.ps1\" >nul & schtasks /Run /TN wmco-wu >nul" \
+    win_ssh "del /q C:\\wmco-wu.status 2>nul & schtasks /Create /F /TN wmco-wu /RU SYSTEM /RL HIGHEST /SC ONCE /SD 01/01/2099 /ST 00:00 /TR \"powershell -NoProfile -ExecutionPolicy Bypass -File C:\\wmco-wu.ps1\" >nul 2>&1 & schtasks /Run /TN wmco-wu >nul" \
       || die "Could not start the Windows Update task."
-    t0=$(date +%s); last_min=-1; status=""
+    t0=$(date +%s); last_min=-1; status=""; cur_phase=""; phase_since=$t0
+    # Show only log lines written by this round (the log keeps earlier rounds)
+    local seen log_txt total
+    seen=$(win_ssh "type C:\\wmco-wu.log 2>nul" 2>/dev/null | tr -d '\r' | grep -c . || true)
+    seen=${seen:-0}
     while :; do
       status=$(win_ssh "type C:\\wmco-wu.status 2>nul" 2>/dev/null | tr -d '\r' || true)
       [[ -n "$status" ]] && break
       (( $(date +%s) - t0 > 90 * 60 )) && die "Windows Update round $round did not finish within 90 min."
       local m=$(( ($(date +%s) - t0) / 60 ))
       if (( m != last_min )); then
-        info "  ${m} min - $(win_ssh "powershell -NoProfile -Command \"Get-Content C:\\wmco-wu.log -Tail 1\"" 2>/dev/null | tr -d '\r' | cut -c21- || true)"
+        # Same data as: ssh ... type C:\wmco-wu.log   and the host build query
+        log_txt=$(win_ssh "type C:\\wmco-wu.log 2>nul" 2>/dev/null | tr -d '\r' || true)
+        total=$(printf '%s\n' "$log_txt" | grep -c . || true)
+        if (( total > seen )); then
+          printf '%s\n' "$log_txt" | grep . | tail -n +"$((seen + 1))" | sed 's/^/      log: /'
+          seen=$total
+        fi
+        line=$(printf '%s\n' "$log_txt" | grep . | tail -1 | cut -c21-)
+        info "  ${m} min - host build $(host_build || echo '?') - ${line:-starting}"
         last_min=$m
+        if [[ "$line" != "$cur_phase" ]]; then cur_phase=$line; phase_since=$(date +%s); fi
+        # The search itself normally takes a few minutes; a long hang is a known WU behaviour
+        if [[ "$cur_phase" == "Searching for updates" ]] && (( $(date +%s) - phase_since > WU_SEARCH_TIMEOUT_MIN * 60 )); then
+          warn "Update search hung for ${WU_SEARCH_TIMEOUT_MIN} min - stopping it"
+          win_ssh "schtasks /End /TN wmco-wu" >/dev/null 2>&1 || true
+          status="HUNG"
+          break
+        fi
       fi
       sleep 30
     done
@@ -840,8 +969,10 @@ PSEOF
       NONE)   ok "No more updates available"; break ;;
       DONE)   ok "Updates installed (no reboot needed)" ;;
       REBOOT) ok "Updates installed - rebooting ($(elapsed "$t0"))"
-              win_ssh "shutdown /r /t 5 /c \"WMCO setup: Windows updates\"" >/dev/null 2>&1 || true
-              wait_for_reboot ;;
+              win_reboot ;;
+      HUNG)   if host_up_to_date "$want"; then ok "Host is already up to date - not waiting for the search"; break; fi
+              info "Host not up to date yet - rebooting (once servicing is idle) and retrying"
+              win_reboot ;;
       *)      hint "ssh -i $SSH_KEY Administrator@$WIN_IP type C:\\wmco-wu.log"
               die "Windows Update failed: $status" ;;
     esac
@@ -1215,11 +1346,15 @@ main() {
       ensure_libvirt_group "$@"
       status
       ;;
+    stop-windows-updates)
+      ensure_libvirt_group "$@"
+      stop_updates
+      ;;
     -h|--help|help)
-      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
       ;;
     *)
-      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status]"
+      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|stop-windows-updates]"
       ;;
   esac
 }
