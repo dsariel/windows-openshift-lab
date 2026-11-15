@@ -99,7 +99,10 @@ on_exit() {
   echo "  - Start over:              ./setup.sh cleanup && ./setup.sh" >&2
 }
 
-virsh_() { virsh -q -c "$LIBVIRT_URI" "$@"; }
+# LC_ALL=C: output such as "shut off" is parsed below and must not be translated
+virsh_() { LC_ALL=C virsh -q -c "$LIBVIRT_URI" "$@"; }
+# Note: never pipe into "grep -q" under pipefail - grep exits on the first match,
+# the writer gets SIGPIPE and the pipeline reports failure. Match on captured output.
 
 SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no
           -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
@@ -115,7 +118,7 @@ ensure_libvirt_group() {
   command -v virsh >/dev/null || return   # packages get installed in phase 1
   local grp=libvirt
   getent group libvirt >/dev/null || grp=libvirtd
-  if ! id -nG "$USER" | tr ' ' '\n' | grep -qx "$grp"; then
+  if ! grep -qx "$grp" <<<"$(id -nG "$USER" | tr ' ' '\n')"; then
     info "Adding $USER to the $grp group (sudo)"
     sudo usermod -aG "$grp" "$USER"
   fi
@@ -180,8 +183,9 @@ check_prereqs() {
     if ! virsh_ net-info "$LIBVIRT_NET" >/dev/null 2>&1; then
       die "libvirt network '$LIBVIRT_NET' not found (set LIBVIRT_NET or BRIDGE)."
     fi
-    if ! virsh_ net-info "$LIBVIRT_NET" | grep -q 'Active:.*yes'; then
-      virsh_ net-start "$LIBVIRT_NET"
+    if ! grep -qx "$LIBVIRT_NET" <<<"$(virsh_ net-list --name)"; then   # lists active networks only
+      virsh_ net-start "$LIBVIRT_NET" >/dev/null 2>&1 || true            # tolerate "already active"
+      grep -qx "$LIBVIRT_NET" <<<"$(virsh_ net-list --name)" || die "libvirt network '$LIBVIRT_NET' could not be started."
     fi
     virsh_ net-autostart "$LIBVIRT_NET" >/dev/null
     ok "Network: libvirt NAT network '$LIBVIRT_NET'"
@@ -538,7 +542,7 @@ prereserve_dhcp() {
 reserve_dhcp() {
   [[ -n "$BRIDGE" ]] && return
   local mac; mac=$(vm_mac)
-  if virsh_ net-dumpxml "$LIBVIRT_NET" | grep -q "mac='$mac'"; then return; fi
+  if grep -q "mac='$mac'" <<<"$(virsh_ net-dumpxml "$LIBVIRT_NET")"; then return; fi
   if virsh_ net-update "$LIBVIRT_NET" add ip-dhcp-host \
        "<host mac='$mac' name='$WIN_HOSTNAME' ip='$WIN_IP'/>" --live --config >/dev/null 2>&1; then
     ok "Reserved DHCP lease $WIN_IP for $mac (IP stays stable across reboots)"
@@ -620,7 +624,7 @@ wait_for_access() {
   api=$(oc get infrastructure cluster -o jsonpath='{.status.apiServerInternalURI}')
   host=${api#https://}; port=${host##*:}; host=${host%%:*}
   local test_cmd="if ((Test-NetConnection -ComputerName '$host' -Port $port -WarningAction SilentlyContinue).TcpTestSucceeded) { 'ok' }"
-  if ! win_ps "$test_cmd" 2>/dev/null | grep -q ok; then
+  if ! grep -q ok <<<"$(win_ps "$test_cmd" 2>/dev/null)"; then
     # Names like api-int.crc.testing resolve on this host (NetworkManager dnsmasq)
     # but not inside the VM: pin them in the Windows hosts file.
     local ext name addr
@@ -632,7 +636,7 @@ wait_for_access() {
         && info "Added '$addr $name' to the Windows hosts file"
     done
   fi
-  if win_ps "$test_cmd" 2>/dev/null | grep -q ok; then
+  if grep -q ok <<<"$(win_ps "$test_cmd" 2>/dev/null)"; then
     ok "Windows can reach $host:$port"
   else
     warn "Windows cannot reach the internal API ($host:$port). The node will not be able to join."
@@ -732,7 +736,7 @@ EOF
     node=$(oc get nodes -l kubernetes.io/os=windows \
              -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[*].address}{"\n"}{end}' 2>/dev/null \
            | awk -v ip="$WIN_IP" '{for (i=2;i<=NF;i++) if ($i==ip) {print $1; exit}}' || true)
-    if [[ -n "$node" ]] && oc get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True; then
+    if [[ -n "$node" ]] && [[ "$(oc get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" == True ]]; then
       break
     fi
     (( $(date +%s) > deadline )) && {
