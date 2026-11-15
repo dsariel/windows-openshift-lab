@@ -891,10 +891,15 @@ spec:
   template:
     metadata:
       labels: {app: iis}
+      annotations:
+        # Without this, SCC admission prefers the more restrictive restricted-v2,
+        # which forces runAsNonRoot=true and the kubelet refuses ContainerAdministrator.
+        openshift.io/required-scc: privileged
     spec:
       serviceAccountName: iis
       runtimeClassName: windows2025
       securityContext:
+        runAsNonRoot: false
         windowsOptions:
           runAsUserName: ContainerAdministrator
       containers:
@@ -937,6 +942,11 @@ EOF
       local reason
       reason=$(oc get pod -n "$TEST_NS" -l app=iis -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
       info "${m} min elapsed - pod ${reason:-pending}"
+      if [[ "$reason" == CreateContainerConfigError || "$reason" == ErrImagePull || "$reason" == ImagePullBackOff || "$reason" == CrashLoopBackOff ]]; then
+        oc get pod -n "$TEST_NS" -l app=iis -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.message}' 2>/dev/null \
+          | sed 's/^/      /' >&2 || true
+        echo >&2
+      fi
       last_min=$m
     fi
     sleep 15
