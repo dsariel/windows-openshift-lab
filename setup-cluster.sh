@@ -24,9 +24,13 @@ CRC_CPUS="${CRC_CPUS:-4}"
 CRC_DISK_GB="${CRC_DISK_GB:-40}"
 WIN_VM_RAM_MB="${VM_RAM_MB:-8192}"          # what setup.sh will use for Windows (resource check)
 PULL_SECRET_FILE="${PULL_SECRET_FILE:-$SCRIPT_DIR/pull-secret.txt}"
-CRC_VERSION="${CRC_VERSION:-latest}"        # crc release to download, e.g. 2.64.0 (ships OpenShift 4.22.14)
-CRC_URL="${CRC_URL:-https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/$CRC_VERSION/crc-linux-amd64.tar.xz}"
-MIN_OCP_VERSION="${MIN_OCP_VERSION:-4.22}"  # WMCO 10.22+ (Windows Server 2025 support) needs OpenShift 4.22+
+# Each crc release embeds exactly one OpenShift bundle; crc 2.64.0 -> OpenShift 4.22.14
+# (see https://mirror.openshift.com/pub/openshift-v4/clients/crc/<version>/release-info.json).
+# "latest" currently resolves to crc 2.65.0 / OpenShift 5.0.0, so pin instead.
+CRC_VERSION="${CRC_VERSION:-2.64.0}"
+CRC_MIRROR="${CRC_MIRROR:-https://mirror.openshift.com/pub/openshift-v4/clients/crc}"
+CRC_URL="${CRC_URL:-$CRC_MIRROR/$CRC_VERSION/crc-linux-amd64.tar.xz}"
+OCP_MINOR="${OCP_MINOR:-4.22}"              # WMCO 10.22 (Windows Server 2025 support) ships for OpenShift 4.22
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 HYBRID_CIDR="${HYBRID_CIDR:-10.132.0.0/14}"
 HYBRID_HOST_PREFIX="${HYBRID_HOST_PREFIX:-23}"
@@ -112,7 +116,8 @@ check_host() {
 # ----------------------------------------------------------------------------
 # OpenShift version bundled with the crc binary on PATH ("OpenShift version: 4.22.14")
 crc_ocp_version() { crc version 2>/dev/null | awk -F': *' '/OpenShift version/ {print $2; exit}'; }
-version_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
+# true if version $1 belongs to minor $2 (4.22.14 ~ 4.22)
+same_minor() { [[ "$1" == "$2" || "$1" == "$2".* ]]; }
 
 download_crc() {
   info "Downloading crc ($CRC_VERSION) from $CRC_URL"
@@ -132,20 +137,20 @@ install_crc() {
   if [[ -z "$ocp" ]]; then
     download_crc
     ocp=$(crc_ocp_version)
-  elif ! version_ge "$ocp" "$MIN_OCP_VERSION"; then
-    warn "Installed crc ($(command -v crc)) bundles OpenShift $ocp; need >= $MIN_OCP_VERSION"
+  elif ! same_minor "$ocp" "$OCP_MINOR"; then
+    warn "Installed crc ($(command -v crc)) bundles OpenShift $ocp; need $OCP_MINOR.x"
     download_crc
     ocp=$(crc_ocp_version)
     [[ "$(command -v crc)" == "$BIN_DIR/crc" ]] || die "An older crc at $(command -v crc) shadows $BIN_DIR/crc - remove it."
   fi
-  version_ge "$ocp" "$MIN_OCP_VERSION" \
-    || die "crc $CRC_VERSION bundles OpenShift $ocp (< $MIN_OCP_VERSION). Set CRC_VERSION to a newer release."
+  same_minor "$ocp" "$OCP_MINOR" \
+    || die "crc $CRC_VERSION bundles OpenShift $ocp, not $OCP_MINOR.x. Set CRC_VERSION to a matching release."
   ok "crc $(crc version | awk -F': *' '/CRC version/ {print $2; exit}') with OpenShift $ocp"
 
   # An existing cluster created from an older bundle must be recreated
   if [[ -d "$HOME/.crc/machines/crc" ]] && ! crc_running; then
     local cur; cur=$(crc status -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("openshiftVersion",""))' 2>/dev/null || true)
-    if [[ -n "$cur" ]] && ! version_ge "$cur" "$MIN_OCP_VERSION"; then
+    if [[ -n "$cur" ]] && ! same_minor "$cur" "$OCP_MINOR"; then
       die "Existing crc cluster is OpenShift $cur. Run './setup-cluster.sh cleanup' first to recreate it with $ocp."
     fi
   fi
@@ -196,7 +201,7 @@ start_cluster() {
   ok "Logged in as $user (cluster-admin) at $api"
 
   local cv; cv=$(oc get clusterversion version -o jsonpath='{.status.desired.version}')
-  version_ge "$cv" "$MIN_OCP_VERSION" || die "Cluster runs OpenShift $cv; need >= $MIN_OCP_VERSION. Run cleanup and retry."
+  same_minor "$cv" "$OCP_MINOR" || die "Cluster runs OpenShift $cv; need $OCP_MINOR.x. Run cleanup and retry."
   ok "OpenShift $cv"
 
   info "Waiting for cluster operators to settle"
