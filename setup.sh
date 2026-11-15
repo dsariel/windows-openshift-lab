@@ -15,6 +15,8 @@ set -Eeuo pipefail
 # Configuration
 # ----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# crc and the oc it ships (installed by setup-cluster.sh)
+export PATH="$HOME/.local/bin:$PATH:$HOME/.crc/bin/oc"
 
 VM_NAME="${VM_NAME:-win2025-wmco}"
 WIN_HOSTNAME="${WIN_HOSTNAME:-win2025-wmco}"          # max 15 chars, lowercase -> node name
@@ -154,6 +156,39 @@ install_packages() {
   fi
 }
 
+# Log in automatically when the cluster is OpenShift Local (crc); tokens from
+# 'oc login' expire after ~24h, so a re-run the next day would otherwise fail.
+ensure_oc_login() {
+  local err
+  if err=$(oc whoami 2>&1); then return; fi
+  if command -v crc >/dev/null && [[ -d "$HOME/.crc/machines/crc" ]]; then
+    local st
+    st=$(crc status -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("openshiftStatus",""))' 2>/dev/null || true)
+    if [[ "$st" != "Running" ]]; then
+      hint "Start it with: crc start   (or ./setup-cluster.sh)"
+      die "The crc cluster is not running (status: ${st:-unknown})."
+    fi
+    info "oc session expired or missing - logging in to crc as kubeadmin"
+    local creds user pass api
+    creds=$(crc console --credentials -o json)
+    user=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["clusterConfig"]["adminCredentials"]["username"])' <<<"$creds")
+    pass=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["clusterConfig"]["adminCredentials"]["password"])' <<<"$creds")
+    api=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["clusterConfig"]["url"])' <<<"$creds")
+    if oc login -u "$user" -p "$pass" "$api" --insecure-skip-tls-verify=true >/dev/null 2>&1; then
+      return
+    fi
+    # Fall back to crc's certificate-based admin kubeconfig
+    if [[ -f "$HOME/.crc/machines/crc/kubeconfig" ]]; then
+      export KUBECONFIG="$HOME/.crc/machines/crc/kubeconfig"
+      oc whoami >/dev/null 2>&1 && { info "Using crc admin kubeconfig ($KUBECONFIG)"; return; }
+    fi
+    die "Could not log in to the crc cluster. Try: crc console --credentials"
+  fi
+  echo "    oc: ${err%%$'\n'*}" >&2
+  hint "No cluster? ./setup-cluster.sh creates a local OpenShift cluster and logs you in."
+  die "oc is not logged in. Run 'oc login ...' as cluster-admin."
+}
+
 check_prereqs() {
   phase 1 "Prerequisites" "<1 min"
   install_packages
@@ -167,10 +202,7 @@ check_prereqs() {
   virsh_ list >/dev/null || die "Cannot connect to $LIBVIRT_URI"
   ok "libvirt reachable ($LIBVIRT_URI)"
 
-  if ! oc whoami >/dev/null 2>&1; then
-    hint "No cluster? ./setup-cluster.sh creates a local OpenShift cluster and logs you in."
-    die "oc is not logged in. Run 'oc login ...' as cluster-admin."
-  fi
+  ensure_oc_login
   oc auth can-i '*' '*' --all-namespaces >/dev/null 2>&1 || die "Current oc user ($(oc whoami)) is not cluster-admin."
   ok "OpenShift: $(oc whoami) @ $(oc whoami --show-server)"
 
