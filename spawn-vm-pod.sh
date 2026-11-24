@@ -770,8 +770,8 @@ show_fedora_summary() {
   echo "  oc delete ns $VIRT_TEST_NS  # removes everything"
   echo
   echo "${C_Y}${C_B}Documentation:${C_0}"
-  echo "  VM Operations: $WORK_DIR/VM-OPERATIONS-GUIDE.md"
-  echo "  Windows VMs:   $WORK_DIR/WINDOWS-VM-GUIDE.md"
+  echo "  VM Operations: docs/VM-OPERATIONS.md"
+  echo "  Windows VMs:   docs/VM-AS-POD.md"
 }
 
 show_windows_summary() {
@@ -813,9 +813,9 @@ show_windows_summary() {
 # ----------------------------------------------------------------------------
 create_windows_docs() {
   mkdir -p "$WORK_DIR"
-  local doc="$WORK_DIR/WINDOWS-VM-GUIDE.md"
+  local doc="docs/VM-AS-POD.md"
   cat > "$doc" <<'DOCEOF'
-# Windows VM as a Pod - Production Guide
+# Windows VM as a Pod - Deployment Guide
 
 This guide explains how to run Windows VMs as pods in OpenShift Virtualization.
 
@@ -841,7 +841,7 @@ CRC (single-node local cluster) has limitations:
 
 3. **ISO Import**: CDI (Container Data Importer) import stuck on local storage
 
-## Windows VM on Production Clusters
+## Windows VM on Multi-Node Clusters
 
 ### Prerequisites
 
@@ -888,7 +888,7 @@ spec:
 
 ### Method 3: Pre-built Windows Image
 
-Best for production - create a qcow2 image with Windows pre-installed:
+Recommended approach - create a qcow2 image with Windows pre-installed:
 
 ```yaml
 apiVersion: cdi.kubevirt.io/v1beta1
@@ -1048,7 +1048,7 @@ DOCEOF
   ok "Created Windows VM guide: $doc"
 
   # Create VM operations guide
-  local ops_doc="$WORK_DIR/VM-OPERATIONS-GUIDE.md"
+  local ops_doc="docs/VM-OPERATIONS.md"
   if [[ ! -f "$ops_doc" ]]; then
     # VM operations guide would be created here if not exists
     # For now, it's created separately
