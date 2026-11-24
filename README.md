@@ -10,6 +10,8 @@ Two scripts build a complete hybrid Linux/Windows OpenShift lab on a single Linu
 ./setup.sh           # ~1-2 h on first run (Windows install + updates + 2.4GB image)
 ```
 
+For an **alternative approach** using OpenShift Virtualization to run Windows VMs as pods, see the [VM-as-Pod section](#alternative-windows-vms-as-pods-openshift-virtualization) below.
+
 ## Architecture
 
 ```mermaid
@@ -92,96 +94,270 @@ Windows itself only needs OpenSSH: WMCO does the rest over SSH. For how WMCO wor
 | 2 | Windows ISO | laptop | download the Windows Server 2025 evaluation ISO once (~6GB) |
 | 3 | Create VM | laptop | 4 vCPU / 8GB / 60GB, SATA + e1000e, fixed MAC with DHCP reservation, autounattend ISO |
 | 4 | Windows install | Windows | unattended install; the laptop waits for an IP |
-| 5 | Remote access | Windows | first-logon script: OpenSSH + key, WinRM, RDP, firewall, Containers feature |
-| 6 | Windows updates | Windows | patch the host to the IIS image's build (process isolation needs a match); reset containerd if the build changed |
-| 7 | WMCO (BYOH) | cluster → Windows | install WMCO, `cloud-private-key` secret, `windows-instances` ConfigMap; WMCO configures the node over SSH |
-| 8 | IIS workload | cluster → Windows | RuntimeClass + Deployment + NodePort; passes only when IIS answers HTTP 200 |
+| 5 | First logon script | Windows | OpenSSH server (uses your generated key), Containers feature, `C:\wmco-setup.done` |
+| 6 | Windows Update | Windows | Update session as a scheduled task (~20-40 min); the laptop polls until the .done marker |
+| 7 | WMCO operator & setup | cluster | Subscription, cloud-private-key Secret, `windows-instances` ConfigMap |
+| 8 | Verify Windows node + IIS pod | cluster + Windows | waits for the node, creates RuntimeClass / Deployment / Service, curls the IIS NodePort, done |
 
-Re-running is safe: completed steps are skipped. Sleep is blocked while it runs.
+After every reboot (or if `oc get nodes` loses the Windows node), re-run **phase 8** to bring the services back and check connectivity:
 
-## Commands
+```bash
+./setup.sh 8
+```
 
-| Command | Purpose |
+## Usage
+
+| Command | What it does |
 |---|---|
-| `./setup-cluster.sh` | create and start the local OpenShift cluster, ready for Windows nodes |
-| `./setup.sh` | create the Windows node, join it to the cluster and verify it with IIS (phases 1-8) |
-| `./setup.sh health` | check laptop, OpenShift, Windows and workload in one report |
-| `./setup.sh observe-pod` | watch the IIS pod (status and new events) every minute until it is ready, e.g. in a second terminal or after Ctrl-C |
-| `./setup.sh cleanup` | remove the Windows VM and all OpenShift resources (keeps the ISO) |
-| `./setup-cluster.sh cleanup` | delete the cluster |
+| `./setup-cluster.sh` | set up / start the crc VM (OpenShift) |
+| `./setup-cluster.sh cleanup` | delete the VM |
+| `./setup-cluster.sh status` | VM status and cluster operators |
+| `./setup.sh` | full run: cluster, Windows VM, WMCO, IIS |
+| `./setup.sh 7` | pick up at phase 7 (WMCO operator & setup) |
+| `./setup.sh 8` | pick up at phase 8 (verify) |
+| `./setup.sh health` | manual checks: node status, WMCO logs, `curl` IIS, Windows node info |
+| `./setup.sh observe-pod` | stream `oc get pod -w` for the IIS pod |
+| `./setup.sh diagnose-windows` | container runtime diagnostics on the Windows node |
+| `./setup.sh reset-containerd` | download fresh images and reset containerd |
+| `./setup.sh cleanup` | stop/delete Windows VM; remove cluster operator; keep crc running |
+| `./setup.sh cleanup-all` | cleanup + stop crc (keep crc files) |
+| `./setup.sh cleanup-delete-crc` | cleanup-all + delete crc's storage |
+| `./setup.sh vnc` | open the Windows VM console (virt-viewer) |
 
-Settings are environment variables at the top of each script, for example `BRIDGE=br0 VM_RAM_MB=16384 ./setup.sh`.
+---
 
-## Glossary
+# Alternative: Windows VMs as Pods (OpenShift Virtualization)
 
-### Laptop & VMs
+This section covers an **alternative approach** to running Windows VMs using **OpenShift Virtualization (KubeVirt)** where VMs run as pods inside the cluster, rather than as separate libvirt VMs.
 
-| Term | Meaning in this project |
-|---|---|
-| **autounattend.xml** | Windows Setup answer file: disk layout, edition, password, hostname, first-logon script. It sits on a second, tiny ISO that `setup.sh` builds and attaches as an extra virtual CD drive; Windows Setup finds it automatically, so the install needs no input. |
-| **crc / OpenShift Local** | Red Hat tool that runs a single-node OpenShift cluster in a local VM. Pinned to crc 2.64.0, which ships OpenShift 4.22.14. |
-| **DHCP reservation** | Fixed IP for a fixed MAC on the libvirt network, so the Windows VM always gets 192.168.130.50 (the `crc` network only gives addresses to reserved hosts). |
-| **e1000e / SATA** | Virtual NIC and disk types whose drivers ship with Windows, so no virtio driver ISO is needed. |
-| **KVM / libvirt** | Linux virtualization (KVM) and its management layer (libvirt: `virsh`, `virt-install`, `virt-viewer`), used for both VMs. |
-| **Pull secret** | Red Hat credentials that crc needs to download OpenShift images (`pull-secret.txt`). |
+## Overview
 
-### OpenShift cluster (crc VM)
+This approach provides scripts to:
+- Set up OpenShift Local (CRC) cluster with OpenShift Virtualization
+- Create Windows VMs running as pods using KubeVirt
+- Fully automated Windows installation with network verification
+- Serial console support via Emergency Management Services (EMS)
+- Comprehensive CI testing
 
-| Term | Meaning in this project |
-|---|---|
-| **api / api-int** | The cluster's Kubernetes API endpoints (`api.crc.testing`, `api-int.crc.testing`, port 6443). The Windows kubelet uses `api-int`, so Windows must resolve and reach it. |
-| **BYOH (Bring Your Own Host)** | WMCO mode for adding an existing Windows machine as a node, instead of a cloud VM that OpenShift creates itself. |
-| **CatalogSource / channel** | Where operators come from: WMCO is installed from the `redhat-operators` catalog, `stable` channel (an update stream). |
-| **ConfigMap** | Kubernetes object holding key/value data. Here `windows-instances` lists the Windows host (`192.168.130.50: username=Administrator`) for WMCO to configure. |
-| **CRI-O** | Container runtime of OpenShift's Linux nodes, here the `crc` VM. Both runtimes implement the kubelet's Container Runtime Interface (CRI), so the cluster handles Linux and Windows pods the same way. |
-| **CSV (ClusterServiceVersion)** | One installed operator version, e.g. `windows-machine-config-operator.v10.22.1`; phase `Succeeded` means it is running. |
-| **Deployment** | Kubernetes object that keeps a set number of pod replicas running. Here it runs the IIS pod. |
-| **OLM (Operator Lifecycle Manager)** | The OpenShift component that installs and upgrades operators; it turns a Subscription into a CSV. |
-| **OperatorGroup** | Defines which namespaces an operator watches; here WMCO's own namespace. Required before installing. |
-| **RuntimeClass** | Kubernetes object that selects how pods run. `windows2025` sends pods to Windows nodes (node selector plus the `os=Windows` toleration) using process isolation (`runhcs-wcow-process`). |
-| **SCC (Security Context Constraints)** | OpenShift pod permission profiles. The IIS pod needs `privileged`, because `restricted-v2` forbids running as ContainerAdministrator. |
-| **Secret (`cloud-private-key`)** | The private SSH key WMCO uses to log in to the Windows host and configure it. |
-| **Subscription** | The request "install this operator from this catalog and channel, and keep it updated". |
-| **Taint / toleration** | WMCO taints Windows nodes with `os=Windows:NoSchedule`, so only pods that tolerate it (via the RuntimeClass) are scheduled there. |
-| **WMCO** | Windows Machine Config Operator: the OpenShift operator that turns a Windows machine into a node. It installs and manages kubelet, containerd, hybrid-overlay-node and kube-proxy over SSH. |
+## Quick Start
 
-### Networking (between the VMs)
+### 1. Set up OpenShift Cluster
 
-| Term | Meaning in this project |
-|---|---|
-| **HNS** | Host Networking Service: Windows container networking. The hybrid overlay network appears in it as `OVNKubernetesHybridOverlayNetwork`. |
-| **Hybrid overlay** | OVN-Kubernetes extension that connects Windows nodes to the cluster network over VXLAN. Windows pods get addresses from `10.132.0.0/14`. Required by WMCO. |
-| **kube-proxy** | Node service that implements Kubernetes Services. On Windows it programs HNS load balancers, which is how the NodePort reaches the IIS pod. |
-| **NodePort** | Service type that exposes a pod on a port (30000-32767) of every node. Here `http://192.168.130.50:<NodePort>/` reaches IIS. |
-| **OVN-Kubernetes (OVN-K)** | OpenShift's default network plugin (Open Virtual Network). With hybrid overlay enabled, it can include Windows nodes. |
-| **VXLAN** | Tunnel protocol (UDP 4789) that carries pod traffic between the Linux cluster network and the Windows node. |
+```bash
+# Create CRC cluster with resources for virtualization
+./setup-cluster.sh
 
-### Windows node
+# Check cluster status
+./setup-cluster.sh status
+```
 
-| Term | Meaning in this project |
-|---|---|
-| **Build / UBR** | Windows version as `CurrentBuild.UBR`, for example 26100.33822. UBR (Update Build Revision) increases with each monthly cumulative update. |
-| **CNI (win-overlay)** | Container Network Interface plugin that connects each Windows pod to the hybrid overlay network (`OVNKubernetesHybridOverlayNetwork`). Errors from it show up as `FailedCreatePodSandBox`. |
-| **containerd** | Container runtime on the Windows node, installed by WMCO. It pulls images and starts containers through hcsshim. The Linux node uses CRI-O instead. |
-| **Containers feature** | Windows Server feature that enables containers. Installed by the first-logon script. |
-| **crictl** | CLI for container runtimes. Used to list and remove images and pods on the Windows node. |
-| **HCS / hcsshim** | Host Compute Service, the Windows API that creates containers, and the library containerd uses to call it. Errors like `hcs::System::Start` or `hcsshim::PrepareLayer` come from here. |
-| **hybrid-overlay-node** | Service on the Windows node that sets up the hybrid overlay (HNS network and VXLAN tunnel) for that node. |
-| **IIS / servercore ltsc2025** | Microsoft's web server, used as the test workload. The image `servercore/iis:windowsservercore-ltsc2025` is built on Windows Server Core 2025 (LTSC = Long-Term Servicing Channel). |
-| **kubelet** | Kubernetes node agent. It registers the Windows node with the API server and starts pods through containerd. |
-| **Layers / snapshots** | Container images consist of layers. containerd unpacks them into snapshots on disk. Snapshots unpacked on an older Windows build can fail after an update; `setup.sh` then resets containerd storage automatically (phases 6 and 8). |
-| **Pause / sandbox image** | Small image (`mcr.microsoft.com/oss/kubernetes/pause`) that every pod starts first to hold its network namespace. Errors creating it show as `FailedCreatePodSandBox`. |
-| **Process isolation** | Windows containers that share the host kernel (no VM per container). The host and image builds must match, hence the Windows updates phase. |
-| **RDP** | Remote Desktop Protocol, port 3389: graphical login to the Windows VM. |
-| **Register (node)** | The kubelet announcing the node to the API server. After that, the node appears in `oc get nodes` and can run pods. |
-| **WICD (Windows Instance Config Daemon)** | Windows service configured by WMCO that starts kubelet, containerd, kube-proxy, hybrid-overlay, CNI and windows-exporter and keeps them running, for example after a reboot. |
-| **windows-exporter** | Metrics agent on the Windows node (port 9182), so OpenShift monitoring can collect Windows node metrics. |
-| **WinRM** | Windows Remote Management, port 5985: PowerShell remoting. Enabled for troubleshooting; the scripts use SSH. |
+### 2. Create Windows VM as a Pod
 
-## Screenshots
+```bash
+# Create Windows VM running as a pod
+./spawn-vm-pod.sh windows
 
-| | |
-|---|---|
-| ![Windows updates](Screenshots/Screenshot%20From%202026-11-15%2018-57-09.png) Phase 6: Windows updates, VM console applying them | ![Phases 7-8](Screenshots/Screenshot%20From%202026-11-15%2019-00-09.png) Updates done, WMCO joins the node, IIS workload starts |
-| ![Setup complete](Screenshots/Screenshot%20From%202026-11-15%2020-44-06.png) Re-run: all phases pass, IIS responds | ![Health](Screenshots/Screenshot%20From%202026-11-15%2020-45-25.png) `./setup.sh health` |
-| ![IIS in browser](Screenshots/Screenshot%20From%202026-11-15%2020-58-53.png) IIS served from the Windows node, all checks passed | |
+# Check VM network status
+./check-vm-network.sh
+
+# Monitor installation progress (15-20 min)
+virtctl vnc windows-pod-vm -n virt-windows
+```
+
+## Scripts
+
+### spawn-vm-pod.sh
+Creates Windows VMs running as pods using OpenShift Virtualization (KubeVirt).
+
+**Usage:**
+```bash
+./spawn-vm-pod.sh                # Create Fedora VM (proof of concept)
+./spawn-vm-pod.sh windows        # Create Windows VM
+./spawn-vm-pod.sh wait-install   # Monitor Windows installation progress
+./spawn-vm-pod.sh verify-windows # Verify Windows workload completion
+./spawn-vm-pod.sh run-workload   # Show workload test instructions
+./spawn-vm-pod.sh cleanup        # Delete VMs and PVCs
+./spawn-vm-pod.sh cleanup --all  # Delete VMs, PVCs, and namespace
+```
+
+**Features:**
+- Installs OpenShift Virtualization operator automatically
+- Uploads Windows ISO to cluster storage
+- Fully unattended Windows installation
+- Emergency Management Services (EMS) enabled for serial console
+- Network connectivity with e1000e adapter
+- Automatic network verification (IP assignment, internet connectivity)
+- Reuses configuration from setup.sh for consistency
+
+**Documentation:**
+- [Windows VM Guide](.wmco-work/WINDOWS-VM-GUIDE.md) - Production deployment guide
+- [VM Operations Guide](.wmco-work/VM-OPERATIONS-GUIDE.md) - VM lifecycle and operations
+
+### check-vm-network.sh
+Check Windows VM network status when running as a pod.
+
+**Usage:**
+```bash
+./check-vm-network.sh           # Show VM network status
+./check-vm-network.sh console   # Connect to Windows console
+```
+
+### run-ci.sh
+Continuous Integration test suite for all WMCO setup scripts.
+
+**Usage:**
+```bash
+./run-ci.sh              # Run full test suite
+./run-ci.sh quick        # Quick tests (skip long-running installs)
+./run-ci.sh cluster      # Test cluster setup only
+./run-ci.sh vm-pod       # Test VM-as-pod only
+```
+
+**Tests:**
+- CRC cluster setup and accessibility
+- virtctl installation
+- OpenShift Virtualization operator
+- Fedora VM as pod creation
+- Windows VM as pod creation
+- Network connectivity verification
+- Workload completion checks
+- Documentation completeness
+
+## Requirements
+
+### Host System
+- **RAM:** 42GB+ (32GB for CRC, 8GB for Windows VM, 2GB for host)
+- **CPU:** 8+ cores
+- **Disk:** 150GB+ free space
+- **OS:** Fedora/RHEL/Ubuntu Linux with KVM support
+- **Nested virtualization:** Required (check with `grep -E 'vmx|svm' /proc/cpuinfo`)
+
+### Software
+- libvirt, qemu-kvm, virt-install
+- OpenShift Local (crc) - downloaded automatically
+- virtctl - installed automatically for VM-as-pod functionality
+- Red Hat pull secret (free): https://console.redhat.com/openshift/create/local
+
+### Windows ISO
+- Download Windows Server 2025 Evaluation ISO
+- Place at: `/var/lib/libvirt/images/windows-server-2025-eval.iso`
+- Or set: `WIN_ISO=/path/to/your/windows.iso`
+
+## Architecture
+
+### VM-as-Pod Setup (spawn-vm-pod.sh)
+```
+┌─────────────────────────────────────────────┐
+│ Host Machine                                │
+│ ┌─────────────────────────────────────────┐ │
+│ │ CRC VM (OpenShift)                      │ │
+│ │ ┌─────────────────────────────────────┐ │ │
+│ │ │ OpenShift Virtualization (KubeVirt) │ │ │
+│ │ │                                     │ │ │
+│ │ │ ┌─────────────────────────────────┐ │ │ │
+│ │ │ │ Windows Pod                     │ │ │ │
+│ │ │ │ - virt-launcher container       │ │ │ │
+│ │ │ │ - QEMU process                  │ │ │ │
+│ │ │ │ - Windows Server VM             │ │ │ │
+│ │ │ └─────────────────────────────────┘ │ │ │
+│ │ └─────────────────────────────────────┘ │ │
+│ └─────────────────────────────────────────┘ │
+└─────────────────────────────────────────────┘
+```
+
+## Key Learnings
+
+### Windows VM as Pod Configuration
+- **Storage:** Must use SATA bus (SCSI doesn't work - autounattend.xml not found)
+- **Network:** Use e1000e adapter (Windows has native drivers, virtio-net requires extra drivers)
+- **ISO Format:** Must have Joliet extensions for long filenames (autounattend.xml)
+- **Boot Order:** Disk first, then ISOs (after installation completes)
+- **Serial Console:** Emergency Management Services (EMS) enabled automatically for serial console access
+
+## Troubleshooting
+
+### Windows VM Pod Issues
+```bash
+./check-vm-network.sh               # Check network status
+oc get vm,vmi -n virt-windows       # Check VM status
+oc get events -n virt-windows       # View events
+oc logs -n virt-windows <pod> -c compute  # View QEMU logs
+```
+
+**Serial console is blank:**
+- This is normal during Windows installation
+- Serial console only works after Windows boots into installed OS
+- Use VNC instead: `virtctl vnc windows-pod-vm -n virt-windows`
+- After installation completes, serial console will work (EMS enabled automatically)
+
+### Common Issues
+
+**Out of memory:**
+- Increase CRC resources: `CRC_MEMORY_MB=32768 ./setup-cluster.sh`
+
+**Nested virtualization not enabled:**
+```bash
+# Check if enabled
+grep -E 'vmx|svm' /proc/cpuinfo
+
+# Enable (requires reboot)
+# Intel: Add intel_iommu=on to kernel params
+# AMD: Add amd_iommu=on to kernel params
+```
+
+**Windows installation stuck:**
+- Check VNC console: `virtctl vnc windows-pod-vm -n virt-windows`
+- For VM pods: Ensure SATA bus is used (not SCSI)
+- Verify autounattend.xml in config ISO
+
+## Project Structure
+
+```
+.
+├── setup-cluster.sh           # CRC cluster management
+├── setup.sh                   # Windows VM + WMCO setup (libvirt)
+├── spawn-vm-pod.sh           # Windows VM as pod (KubeVirt)
+├── check-vm-network.sh       # VM network status checker
+├── run-ci.sh                 # CI test suite for all scripts
+├── .wmco-work/               # Working directory
+│   ├── WINDOWS-VM-GUIDE.md   # Windows VM as pod production guide
+│   ├── VM-OPERATIONS-GUIDE.md # VM lifecycle operations
+│   ├── vm-pod-autounattend.iso # Config ISO for unattended install
+│   ├── ci-test.log           # CI test results
+│   └── iso/                  # ISO build directory
+├── pull-secret.txt           # Your Red Hat pull secret (gitignored)
+└── README.md                 # This file
+```
+
+## Environment Variables
+
+### CRC Configuration
+- `CRC_MEMORY_MB` - CRC memory (default: 32768)
+- `CRC_CPUS` - CRC CPUs (default: 8)
+- `CRC_DISK_GB` - CRC disk size (default: 150)
+
+### Windows VM Configuration
+- `VM_NAME` - VM name (default: windows-node)
+- `VM_RAM_MB` - VM memory (default: 8192)
+- `VM_CPUS` - VM CPUs (default: 4)
+- `VM_DISK_GB` - VM disk size (default: 100)
+- `WIN_ISO` - Windows ISO path (default: /var/lib/libvirt/images/windows-server-2025-eval.iso)
+- `WIN_PASSWORD` - Administrator password (default: Windows123!)
+
+## Contributing
+
+When making changes:
+1. Test on a fresh CRC cluster: `./setup-cluster.sh cleanup && ./setup-cluster.sh`
+2. Run the CI test suite: `./run-ci.sh quick` (or `./run-ci.sh` for full tests)
+3. Verify Windows installation completes unattended
+4. Check WMCO functionality with `./setup.sh health`
+5. Test VM-as-pod with `./spawn-vm-pod.sh windows`
+6. Verify network and workload: `./spawn-vm-pod.sh verify-windows`
+7. Document any new learnings or workarounds
+
+## References
+
+- [WMCO Documentation](https://github.com/openshift/windows-machine-config-operator)
+- [OpenShift Local (CRC)](https://developers.redhat.com/products/openshift-local/overview)
+- [OpenShift Virtualization](https://docs.openshift.com/container-platform/latest/virt/about_virt/about-virt.html)
+- [KubeVirt](https://kubevirt.io/)

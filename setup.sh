@@ -10,6 +10,7 @@
 #   ./setup.sh reset-containerd  Move containerd storage aside on the Windows node; images re-download
 #   ./setup.sh observe-pod   Print the IIS pod table + new pod events every minute until ready
 #   ./setup.sh stop-windows-updates  Stop the Windows Update task on the VM if it is only searching
+#   ./setup.sh spawn-vm-pod      Spawn a Windows VM as a pod using OpenShift Virtualization
 #
 # Every setting below can be overridden from the environment, e.g.:
 #   BRIDGE=br0 VM_RAM_MB=16384 ./setup.sh
@@ -468,6 +469,21 @@ write_autounattend() {
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
+          <Description>Configure EMS port and baud rate</Description>
+          <CommandLine>bcdedit /emssettings EMSPORT:1 EMSBAUDRATE:115200</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Enable Emergency Management Services for serial console</Description>
+          <CommandLine>bcdedit /ems on</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>Enable bootdebug for boot manager</Description>
+          <CommandLine>bcdedit /bootdebug on</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
           <Description>WMCO BYOH host preparation</Description>
           <CommandLine>cmd.exe /c for %d in (D E F G H I J K) do @if exist %d:\wmco-setup.ps1 powershell.exe -NoProfile -ExecutionPolicy Bypass -File %d:\wmco-setup.ps1</CommandLine>
         </SynchronousCommand>
@@ -1840,6 +1856,9 @@ cleanup() {
 # ----------------------------------------------------------------------------
 main() {
   case "${1:-setup}" in
+    spawn-vm-pod)
+      exec "$SCRIPT_DIR/spawn-vm-pod.sh"
+      ;;
     setup|"")
       inhibit_sleep "$@"
       trap 'FAIL_LINE=$LINENO' ERR
@@ -1890,9 +1909,12 @@ main() {
       awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"
       ;;
     *)
-      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|health|diagnose-windows|reset-containerd|observe-pod|stop-windows-updates]"
+      die "Unknown command '$1'. Usage: $0 [setup|cleanup|status|health|diagnose-windows|reset-containerd|observe-pod|stop-windows-updates|spawn-vm-pod]"
       ;;
   esac
 }
 
-main "$@"
+# Only run main if not being sourced
+if [[ "${_SOURCING:-0}" != "1" && "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

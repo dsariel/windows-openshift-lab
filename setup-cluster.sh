@@ -9,6 +9,12 @@
 # Afterwards run ./setup.sh. It attaches the Windows VM to the same libvirt
 # network ("crc") so the cluster and the Windows node can reach each other.
 #
+# Default resources (suitable for OpenShift Virtualization):
+#   - 32GB RAM for CRC, 8GB for Windows VM, 2GB host = ~42GB total required
+#   - 8 CPUs, 100GB disk
+#
+# For WMCO only (no virtualization): CRC_MEMORY_MB=12288 CRC_CPUS=4 CRC_DISK_GB=40
+#
 # Requires a Red Hat pull secret (free account):
 #   https://console.redhat.com/openshift/create/local
 # Save it as ./pull-secret.txt or set PULL_SECRET_FILE=/path/to/pull-secret.
@@ -19,9 +25,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CRC_MEMORY_MB="${CRC_MEMORY_MB:-12288}"     # CRC minimum is 10752
-CRC_CPUS="${CRC_CPUS:-4}"
-CRC_DISK_GB="${CRC_DISK_GB:-40}"
+CRC_MEMORY_MB="${CRC_MEMORY_MB:-32768}"     # 32GB for OpenShift Virtualization with VMs; CRC minimum is 10752
+CRC_CPUS="${CRC_CPUS:-8}"                     # 8 CPUs recommended for virtualization workloads
+CRC_DISK_GB="${CRC_DISK_GB:-150}"             # 150GB for VM images (60GB Windows disk + ISOs + overhead)
 WIN_VM_RAM_MB="${VM_RAM_MB:-8192}"          # what setup.sh will use for Windows (resource check)
 PULL_SECRET_FILE="${PULL_SECRET_FILE:-$SCRIPT_DIR/pull-secret.txt}"
 # Each crc release embeds exactly one OpenShift bundle; crc 2.64.0 -> OpenShift 4.22.14
@@ -104,10 +110,12 @@ check_host() {
   info "Plan: cluster ${CRC_CPUS} CPUs/$((CRC_MEMORY_MB/1024))GB + Windows VM $((WIN_VM_RAM_MB/1024))GB + ~2GB for the host"
   if (( mem_mb < need_mb )); then
     warn "Not enough RAM: need ~$((need_mb/1024))GB, host has $((mem_mb/1024))GB."
-    hint "Lower it, e.g. CRC_MEMORY_MB=10752 VM_RAM_MB=4096 (tight), or use a bigger host."
+    hint "For OpenShift Virtualization: CRC_MEMORY_MB=32768 VM_RAM_MB=8192 (~42GB total)"
+    hint "For WMCO only (no virt): CRC_MEMORY_MB=12288 VM_RAM_MB=8192 (~22GB total)"
+    hint "Minimal setup: CRC_MEMORY_MB=10752 VM_RAM_MB=4096 (~17GB total, tight)"
     [[ "$FORCE" == "1" ]] || die "Aborting (set FORCE=1 to continue anyway)."
   else
-    ok "Memory OK"
+    ok "Memory OK: $((mem_mb/1024))GB available, need ~$((need_mb/1024))GB"
   fi
   (( cpus >= CRC_CPUS )) || die "Host has $cpus CPUs, cluster wants $CRC_CPUS (set CRC_CPUS)."
 
