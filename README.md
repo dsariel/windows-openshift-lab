@@ -229,3 +229,13 @@ flowchart TB
 - [OpenShift Local (CRC)](https://developers.redhat.com/products/openshift-local/overview)
 - [OpenShift Virtualization](https://docs.openshift.com/container-platform/latest/virt/about_virt/about-virt.html)
 - [KubeVirt](https://kubevirt.io/)
+
+
+### Windows Internals & Kernel Study Resources
+
+While Microsoft discontinued the **Windows Academic Program** after **Windows Research Kernel (WRK) v1.2** (based on Windows Server 2003 SP1 / XP x64) and never released modern Windows 10/11 kernel source kits, the following resources are available for studying Windows architecture and internals:
+
+* **[Windows Internals, 7th Edition (Part 1 & Part 2)](https://microsoft.com):** The authoritative guide covering Windows 10 and Windows Server 2016/2019 internals on Microsoft Learn.
+* **[Microsoft Sysinternals](https://microsoft.com):** Live system inspection and troubleshooting utilities (such as Process Explorer, VMMap, and LiveKd) for inspecting Windows internals at runtime.
+* **[Windows Driver Kit (WDK) & WinDbg](https://microsoft.com):** Official Microsoft documentation, kernel debugging tools, and public symbol files (PDBs) for analyzing modern Windows kernel structures.
+* **[Windows Research Kernel (WRK) v1.2](https://github.com) ([BetaWiki Overview](https://betawiki.net)):** Community-preserved mirror of the final 2006 academic kernel source release and Curriculum Resource Kit (CRK) materials *(for academic/reference use under Microsoft's original Shared Source terms)*.
